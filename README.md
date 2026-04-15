@@ -34,7 +34,7 @@ Final prediction for group $k$: $\hat{y}^{(k)} = \alpha \cdot X^{(k)}\hat{\beta}
 pip install ptlasso
 ```
 
-Requires Python ≥ 3.9 and [adelie](https://github.com/JamesYang007/adelie) for the underlying Lasso solver (supports fitting with offsets, which standard sklearn cannot do).
+Requires Python ≥ 3.9 and [adelie](https://github.com/JamesYang007/adelie) for the underlying Lasso solver (supports fitting with offsets, which scikit-learn cannot do).
 
 ---
 

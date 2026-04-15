@@ -1,7 +1,6 @@
 from abc import abstractmethod
 
 from sklearn.base import BaseEstimator
-from sklearn.utils.validation import check_array
 from sklearn.metrics import r2_score
 
 
