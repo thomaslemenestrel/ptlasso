@@ -1,4 +1,31 @@
-"""ptlasso: Pretrained Lasso for sparse linear models."""
+"""ptlasso: Pretrained Lasso for grouped sparse linear models.
+
+Implements the two-step Pretrained Lasso estimator of Craig, Pilanci,
+Le Menestrel et al. (2025, JRSSB).  A global Lasso is fitted on all
+samples first; its linear predictor is then used as an offset when
+fitting per-group Lasso models, allowing each group to borrow strength
+from the overall signal while still learning group-specific coefficients.
+
+Main classes
+------------
+PretrainedLasso
+    Two-step estimator with a fixed pretraining strength ``alpha``.
+PretrainedLassoCV
+    Same estimator with cross-validation over ``alpha``.
+
+Support utilities
+-----------------
+get_overall_support, get_pretrain_support, get_individual_support,
+get_pretrain_support_split
+
+Plotting
+--------
+plot_cv, plot_paths
+
+Simulation helpers
+------------------
+make_data, gaussian_example_data, binomial_example_data
+"""
 
 from ._ptlasso import PretrainedLasso, PretrainedLassoCV
 from ._support import (
@@ -8,6 +35,7 @@ from ._support import (
     get_pretrain_support_split,
 )
 from ._plot import plot_cv, plot_paths
+from ._simulate import make_data, gaussian_example_data, binomial_example_data
 
 __version__ = "0.1.0"
 __all__ = [
@@ -19,4 +47,7 @@ __all__ = [
     "get_individual_support",
     "plot_cv",
     "plot_paths",
+    "make_data",
+    "gaussian_example_data",
+    "binomial_example_data",
 ]

@@ -5,16 +5,47 @@ build-backend = "hatchling.build"
 [project]
 name = "ptlasso"
 version = "0.1.0"
-description = "Pretrained Lasso: a two-step training process for sparse linear models"
+description = "Pretrained Lasso: a two-step procedure for sparse linear models with grouped samples"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
-dependencies = [
-    "numpy",
-    "scikit-learn",
-    "adelie",
-    "matplotlib",
+authors = [
+    { name = "Erin Craig" },
+    { name = "Thomas Le Menestrel" },
+    { name = "Robert Tibshirani" },
 ]
+keywords = [
+    "lasso",
+    "regularization",
+    "sparse",
+    "grouped data",
+    "pretraining",
+    "statistics",
+    "machine learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "numpy>=1.22",
+    "scikit-learn>=1.1",
+    "adelie>=1.0",
+    "matplotlib>=3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/tlemenestrel/ptlasso"
+Repository = "https://github.com/tlemenestrel/ptlasso"
+"Bug Tracker" = "https://github.com/tlemenestrel/ptlasso/issues"
 
 [project.optional-dependencies]
 dev = [
