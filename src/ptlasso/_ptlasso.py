@@ -129,14 +129,16 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
     Two-step training:
     1. Fit an overall Lasso on all samples (lambda selected by internal CV).
     2. For each group, fit a group-specific Lasso with offset
-       ``alpha * eta_overall``, where ``eta_overall`` is the overall
-       linear predictor (before the link function).
+       ``(1 - alpha) * eta_overall``, where ``eta_overall`` is the overall
+       linear predictor (before the link function).  Features not selected
+       by the overall model receive a stronger penalty of ``1 / alpha``.
 
     Parameters
     ----------
     alpha : float in [0, 1], default=0.5
-        Pretraining strength.  ``0`` = no pretraining (equivalent to
-        individual per-group Lasso); ``1`` = fit on residuals only.
+        Pretraining strength.  ``0`` = overall model with fine-tuning
+        (maximum pretraining); ``1`` = individual per-group Lasso
+        (no pretraining).  Matches the R ptLasso convention.
     family : {"gaussian", "binomial", "multinomial"}, default="gaussian"
         Response distribution.
     overall_lambda : {"lambda.1se", "lambda.min"}, default="lambda.1se"
@@ -351,9 +353,20 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         # ----------------------------------------------------------
         # Step 2: per-group models
         # ----------------------------------------------------------
-        # Offset = alpha * overall linear predictor (eta space, before link).
-        # Each group model learns the residual; predict() adds both back together.
+        # Offset = (1 - alpha) * overall linear predictor (eta space, before link).
+        # Matches R convention: alpha=0 → full pretraining, alpha=1 → individual.
+        # Penalty factor: features NOT in the overall support get penalty 1/alpha,
+        # steering the group model to prefer features already selected overall.
         overall_eta = self._overall_eta(X)
+
+        if self.family == "multinomial":
+            overall_support = np.where(np.any(self.overall_coef_ != 0, axis=1))[0]
+        else:
+            overall_support = np.where(self.overall_coef_ != 0)[0]
+
+        _alpha_pf = self.alpha if self.alpha > 0 else 1e-9
+        pf = np.full(self.n_features_in_, 1.0 / _alpha_pf)
+        pf[overall_support] = 1.0
 
         self.pretrain_models_ = {}
         self.individual_models_ = {}
@@ -362,10 +375,10 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             mask = groups == g
             X_g = np.asfortranarray(X[mask])
             glm_g = _make_glm(self.family, y[mask])
-            offset = np.asfortranarray(self.alpha * overall_eta[mask])
+            offset = np.asfortranarray((1 - self.alpha) * overall_eta[mask])
 
             self.pretrain_models_[g] = ad.grpnet(
-                X_g, glm_g, offsets=offset, **self._grpnet_kwargs()
+                X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
             )
             self.individual_models_[g] = ad.grpnet(X_g, glm_g, **self._grpnet_kwargs())
 
@@ -417,13 +430,15 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             X_g = X[mask]
 
             if model == "pretrain":
-                # Total eta = alpha * eta_overall + eta_group.
-                # The group model was trained with offset = alpha * eta_overall,
+                # Total eta = (1-alpha) * eta_overall + eta_group.
+                # The group model was trained with offset = (1-alpha) * eta_overall,
                 # so its eta already captures the residual.
                 eta_group = _eta_from_state(
                     self.pretrain_models_[g], X_g, idx, self.family, self.n_classes_
                 )
-                y_pred[mask] = _apply_link(self.alpha * eta_ov[mask] + eta_group, self.family)
+                y_pred[mask] = _apply_link(
+                    (1 - self.alpha) * eta_ov[mask] + eta_group, self.family
+                )
             else:
                 eta = _eta_from_state(
                     self.individual_models_[g], X_g, idx, self.family, self.n_classes_
@@ -583,6 +598,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
     ----------
     alphas : array-like or None, default=None
         Candidate pretraining strengths.  Defaults to [0, 0.25, 0.5, 0.75, 1.0].
+        ``0`` = maximum pretraining; ``1`` = no pretraining (individual models).
     cv : int, default=5
         Number of CV folds.
     alphahat_choice : {"overall", "mean"}, default="overall"

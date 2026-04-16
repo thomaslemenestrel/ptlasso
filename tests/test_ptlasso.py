@@ -84,9 +84,10 @@ def test_fit_predict_gaussian():
     assert y_pred.shape == (len(y),)
 
 
-def test_alpha_zero_equals_individual():
+def test_alpha_one_equals_individual():
+    # alpha=1 → no pretraining → pretrain predictions == individual predictions
     X, y, groups = _gaussian_data()
-    model = PretrainedLasso(alpha=0).fit(X, y, groups)
+    model = PretrainedLasso(alpha=1).fit(X, y, groups)
     np.testing.assert_allclose(
         model.predict(X, groups, model="pretrain"),
         model.predict(X, groups, model="individual"),

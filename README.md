@@ -1,11 +1,17 @@
 # ptlasso
 
+[![PyPI - Version](https://img.shields.io/pypi/v/ptlasso)](https://pypi.org/project/ptlasso/)
+![versions](https://img.shields.io/pypi/pyversions/ptlasso.svg)
+[![Downloads](https://static.pepy.tech/badge/ptlasso)](https://pepy.tech/project/ptlasso)
+[![Downloads](https://static.pepy.tech/badge/ptlasso/month)](https://pepy.tech/project/ptlasso)
+![GitHub Release](https://img.shields.io/github/v/release/tlemenestrel/ptlasso)
+
 Python implementation of the **Pretrained Lasso** — a two-step procedure for fitting sparse linear models when samples belong to distinct groups, leveraging shared structure across groups via pretraining.
 
 Based on:
 > Craig, E., Pilanci, M., Le Menestrel, T., Narasimhan, B., Rivas, M. A., Gullaksen, S. E., ... & Tibshirani, R. (2025). Pretraining and the lasso. *Journal of the Royal Statistical Society Series B: Statistical Methodology*, qkaf050.
 
----
+--- 
 
 ## The idea
 
@@ -112,6 +118,8 @@ model.fit(X_df, y, groups, group_labels=group_labels)
 ---
 
 ## Inspecting the support
+
+The support is the set of non-zero variables selected by the model, i.e., the features whose coefficients are not shrunk to zero by the L1 regularization and therefore actively contribute to the prediction.
 
 ```python
 from ptlasso import (

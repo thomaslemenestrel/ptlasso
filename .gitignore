@@ -14,13 +14,27 @@ env/
 # Testing
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
 
 # Tools
 .ruff_cache/
+.mypy_cache/
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Docs build output (deployed via gh-pages branch, not committed)
+site/
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo

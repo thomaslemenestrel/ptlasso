@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ptlasso"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pretrained Lasso: a two-step procedure for sparse linear models with grouped samples"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"
 authors = [
     { name = "Erin Craig" },
     { name = "Thomas Le Menestrel" },
@@ -43,15 +43,20 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tlemenestrel/ptlasso"
-Repository = "https://github.com/tlemenestrel/ptlasso"
-"Bug Tracker" = "https://github.com/tlemenestrel/ptlasso/issues"
+Homepage = "https://github.com/thomaslemenestrel/ptlasso"
+Repository = "https://github.com/thomaslemenestrel/ptlasso"
+"Bug Tracker" = "https://github.com/thomaslemenestrel/ptlasso/issues"
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]",
 ]
 
 [tool.hatch.build.targets.wheel]
