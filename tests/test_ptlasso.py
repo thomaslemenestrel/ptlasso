@@ -319,6 +319,9 @@ def test_plot_paths_no_warnings():
     model = PretrainedLasso(alpha=0.5).fit(X, y, groups)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # Ignore deprecation warnings from matplotlib/pyparsing internals (not ptlasso's code)
+        warnings.filterwarnings("ignore", module=r"matplotlib.*")
+        warnings.filterwarnings("ignore", module=r"pyparsing.*")
         fig = plot_paths(model)
     import matplotlib.pyplot as plt
 
@@ -333,6 +336,9 @@ def test_plot_cv_no_warnings():
     cv = PretrainedLassoCV(alphas=[0.0, 0.5, 1.0], cv=3).fit(X, y, groups)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # Ignore deprecation warnings from matplotlib/pyparsing internals (not ptlasso's code)
+        warnings.filterwarnings("ignore", module=r"matplotlib.*")
+        warnings.filterwarnings("ignore", module=r"pyparsing.*")
         fig, ax = plot_cv(cv)
     import matplotlib.pyplot as plt
 

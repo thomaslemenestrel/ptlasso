@@ -436,9 +436,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 eta_group = _eta_from_state(
                     self.pretrain_models_[g], X_g, idx, self.family, self.n_classes_
                 )
-                y_pred[mask] = _apply_link(
-                    (1 - self.alpha) * eta_ov[mask] + eta_group, self.family
-                )
+                y_pred[mask] = _apply_link((1 - self.alpha) * eta_ov[mask] + eta_group, self.family)
             else:
                 eta = _eta_from_state(
                     self.individual_models_[g], X_g, idx, self.family, self.n_classes_
