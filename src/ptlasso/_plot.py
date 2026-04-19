@@ -70,8 +70,9 @@ def _resolve_widths(figure_widths):
 # ------------------------------------------------------------------
 
 
-def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None,
-            colors=None, figure_widths=None):
+def plot_cv(
+    fit, ax=None, plot_alphahat=True, column="single", save=None, colors=None, figure_widths=None
+):
     """Plot the cross-validation curve for a :class:`PretrainedLassoCV`.
 
     Draws the mean CV loss ±1 SE band over alpha, with horizontal reference

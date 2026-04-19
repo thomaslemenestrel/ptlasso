@@ -40,6 +40,7 @@ from ._constants import COLORS, FIGURE_WIDTHS
 
 try:
     from importlib.metadata import version as _version, PackageNotFoundError
+
     __version__ = _version("ptlasso")
 except PackageNotFoundError:
     __version__ = "unknown"

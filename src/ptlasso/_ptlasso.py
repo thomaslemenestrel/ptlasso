@@ -37,8 +37,8 @@ class _StateProxy:
     __slots__ = ("betas", "lmdas", "intercepts")
 
     def __init__(self, betas, lmdas, intercepts):
-        self.betas = betas          # (L, p) or (L, p*K) float64 ndarray
-        self.lmdas = lmdas          # (L,) float64 ndarray
+        self.betas = betas  # (L, p) or (L, p*K) float64 ndarray
+        self.lmdas = lmdas  # (L,) float64 ndarray
         self.intercepts = intercepts  # (L,) or (L, K) float64 ndarray
 
 
