@@ -12,7 +12,7 @@ import adelie as ad
 import numpy as np
 
 from sklearn.base import RegressorMixin
-from sklearn.metrics import r2_score
+from sklearn.metrics import accuracy_score, log_loss, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
@@ -158,6 +158,44 @@ def _fold_loss(y_true, y_pred, family):
     p = np.clip(y_pred, eps, 1)  # multinomial: (n, K)
     idx = y_true.astype(int)
     return float(-np.mean(np.log(p[np.arange(len(idx)), idx])))
+
+
+# ------------------------------------------------------------------
+# Scorer registry (used by PretrainedLassoCV)
+# ------------------------------------------------------------------
+
+# All built-in scorers return higher = better, matching the sklearn convention.
+_SCORERS = {
+    "roc_auc": roc_auc_score,
+    "neg_log_loss": lambda yt, yp: -log_loss(yt, yp),
+    "accuracy": lambda yt, yp: accuracy_score(
+        yt,
+        (yp >= 0.5).astype(int) if np.ndim(yp) == 1 else np.argmax(yp, axis=1),
+    ),
+    "neg_mean_squared_error": lambda yt, yp: -mean_squared_error(yt, yp),
+    "r2": r2_score,
+}
+
+_VALID_SCORERS = tuple(_SCORERS.keys())
+
+
+def _resolve_scorer(scoring):
+    """Return a callable ``(y_true, y_pred) -> float`` (higher = better), or ``None``."""
+    if scoring is None or callable(scoring):
+        return scoring
+    return _SCORERS[scoring]
+
+
+def _cv_loss(scorer_fn, y_true, y_pred, family):
+    """Unified CV loss (lower = better) used throughout the CV loop.
+
+    When *scorer_fn* is ``None`` the family-based loss is used.  Otherwise the
+    scorer (higher = better) is negated so that the existing minimisation logic
+    is unchanged.
+    """
+    if scorer_fn is None:
+        return _fold_loss(y_true, y_pred, family)
+    return -float(scorer_fn(y_true, y_pred))
 
 
 # ------------------------------------------------------------------
@@ -668,6 +706,23 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
     foldid : array-like of int or None, default=None
         Fold assignments, one integer per sample.  When provided, overrides
         the internal ``StratifiedKFold`` splitter.
+    scoring : str, callable, or None, default=None
+        CV criterion used to select the best alpha.  All values follow the
+        **higher = better** convention (matching sklearn).
+
+        - ``None`` — family-based loss: MSE for gaussian, log-loss for
+          binomial/multinomial.  Matches the current default behaviour.
+        - ``"roc_auc"`` — area under the ROC curve (binomial only).
+          Matches R's ``type.measure="auc"``.
+        - ``"neg_log_loss"`` — negative log-loss (binomial/multinomial).
+        - ``"accuracy"`` — classification accuracy (binomial/multinomial).
+        - ``"neg_mean_squared_error"`` — negative MSE (gaussian).
+        - ``"r2"`` — coefficient of determination (gaussian).
+        - callable — any function ``(y_true, y_pred) -> float`` where
+          **higher is better**, e.g. a custom sklearn scorer.
+
+        ``cv_results_`` always stores values as *losses* (lower = better),
+        so AUC will appear as ``-AUC``.
 
     Attributes
     ----------
@@ -715,6 +770,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         min_ratio=0.01,
         verbose=False,
         foldid=None,
+        scoring=None,
     ):
         self.alphas = alphas
         self.cv = cv
@@ -726,6 +782,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         self.min_ratio = min_ratio
         self.verbose = verbose
         self.foldid = foldid
+        self.scoring = scoring
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -755,6 +812,12 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             raise ValueError("lmda_path_size must be a positive integer")
         if not (0.0 < self.min_ratio < 1.0):
             raise ValueError("min_ratio must be in (0, 1)")
+        if self.scoring is not None and not callable(self.scoring):
+            if self.scoring not in _VALID_SCORERS:
+                raise ValueError(
+                    f"scoring must be None, a callable, or one of {_VALID_SCORERS}, "
+                    f"got '{self.scoring}'"
+                )
 
     def _base_estimator(self, alpha):
         """Return a configured PretrainedLasso for a given alpha."""
@@ -831,6 +894,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         unique_groups = np.unique(groups)
         group_sizes = {g: int(np.sum(groups == g)) for g in unique_groups}
 
+        scorer_fn = _resolve_scorer(self.scoring)
+
         # Fold-level accumulators
         fold_losses = {a: [] for a in alphas}
         fold_losses_grp = {a: {g: [] for g in unique_groups} for a in alphas}
@@ -845,13 +910,13 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             for i, a in enumerate(alphas):
                 est = self._base_estimator(a).fit(X_tr, y_tr, g_tr)
                 y_pred = est.predict(X_te, g_te)
-                fold_losses[a].append(_fold_loss(y_te, y_pred, self.family))
+                fold_losses[a].append(_cv_loss(scorer_fn, y_te, y_pred, self.family))
 
                 for g in unique_groups:
                     mask = g_te == g
                     if mask.any():
                         fold_losses_grp[a][g].append(
-                            _fold_loss(y_te[mask], y_pred[mask], self.family)
+                            _cv_loss(scorer_fn, y_te[mask], y_pred[mask], self.family)
                         )
 
                 # Individual and overall baselines don't depend on alpha — compute
@@ -859,8 +924,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                 if i == 0:
                     y_ind = est.predict(X_te, g_te, model="individual")
                     y_ov = est.predict(X_te, g_te, model="overall")
-                    fold_losses_ind.append(_fold_loss(y_te, y_ind, self.family))
-                    fold_losses_ov.append(_fold_loss(y_te, y_ov, self.family))
+                    fold_losses_ind.append(_cv_loss(scorer_fn, y_te, y_ind, self.family))
+                    fold_losses_ov.append(_cv_loss(scorer_fn, y_te, y_ov, self.family))
 
         # Aggregate CV results
         self.cv_results_ = {a: float(np.mean(errs)) for a, errs in fold_losses.items()}
