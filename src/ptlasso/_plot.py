@@ -57,12 +57,21 @@ def _label_map(fit):
     return {i: fit.feature_names_in_[i] for i in range(fit.n_features_in_)}
 
 
+def _resolve_colors(colors):
+    return {**COLORS, **(colors or {})}
+
+
+def _resolve_widths(figure_widths):
+    return {**FIGURE_WIDTHS, **(figure_widths or {})}
+
+
 # ------------------------------------------------------------------
 # plot_cv
 # ------------------------------------------------------------------
 
 
-def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
+def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None,
+            colors=None, figure_widths=None):
     """Plot the cross-validation curve for a :class:`PretrainedLassoCV`.
 
     Draws the mean CV loss ±1 SE band over alpha, with horizontal reference
@@ -80,6 +89,12 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
         Target figure width — ``"single"`` ≈ 3.5 in, ``"double"`` ≈ 7 in.
     save : str or None, default=None
         File path to save the figure (300 dpi).  No file is written when ``None``.
+    colors : dict or None, default=None
+        Override plot colours for ``"overall"``, ``"pretrain"``, and/or
+        ``"individual"``.  Missing keys fall back to :data:`ptlasso.COLORS`.
+    figure_widths : dict or None, default=None
+        Override figure widths for ``"single"`` and/or ``"double"``.
+        Missing keys fall back to :data:`ptlasso.FIGURE_WIDTHS`.
 
     Returns
     -------
@@ -88,7 +103,9 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
     """
     check_is_fitted(fit)
 
-    w = FIGURE_WIDTHS.get(column, 3.5)
+    c = _resolve_colors(colors)
+    w = _resolve_widths(figure_widths).get(column, 3.5)
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(w, w * 0.8))
     else:
@@ -100,12 +117,12 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
 
     # ±1 SE band + pretrain curve
     ax.fill_between(
-        alphas, cv_mean - cv_se, cv_mean + cv_se, color=COLORS["pretrain"], alpha=0.15, linewidth=0
+        alphas, cv_mean - cv_se, cv_mean + cv_se, color=c["pretrain"], alpha=0.15, linewidth=0
     )
     ax.plot(
         alphas,
         cv_mean,
-        color=COLORS["pretrain"],
+        color=c["pretrain"],
         marker="o",
         markersize=5,
         linewidth=2,
@@ -114,10 +131,8 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
     )
 
     # Individual and overall baselines
-    ax.axhline(
-        fit.cv_results_individual_, color=COLORS["individual"], linestyle="--", linewidth=1.8
-    )
-    ax.axhline(fit.cv_results_overall_, color=COLORS["overall"], linestyle="--", linewidth=1.8)
+    ax.axhline(fit.cv_results_individual_, color=c["individual"], linestyle="--", linewidth=1.8)
+    ax.axhline(fit.cv_results_overall_, color=c["overall"], linestyle="--", linewidth=1.8)
 
     # Selected alpha
     if plot_alphahat:
@@ -140,7 +155,7 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
         f"Individual  $|\\hat{{S}}|={n_ind}$",
         va="center",
         fontsize=8,
-        color=COLORS["individual"],
+        color=c["individual"],
         clip_on=False,
     )
     ax.text(
@@ -149,7 +164,7 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
         f"Overall  $|\\hat{{S}}|={n_ov}$",
         va="center",
         fontsize=8,
-        color=COLORS["overall"],
+        color=c["overall"],
         clip_on=False,
     )
 
@@ -157,7 +172,7 @@ def plot_cv(fit, ax=None, plot_alphahat=True, column="single", save=None):
     ax2 = ax.twiny()
     ax2.set_xlim(ax.get_xlim())
     ax2.set_xticks([fit.alpha_])
-    ax2.set_xticklabels([f"$|\\hat{{S}}|={n_pre}$"], fontsize=8, color=COLORS["pretrain"])
+    ax2.set_xticklabels([f"$|\\hat{{S}}|={n_pre}$"], fontsize=8, color=c["pretrain"])
     ax2.tick_params(length=0)
     ax2.spines["top"].set_visible(False)
     ax2.spines["right"].set_visible(False)
@@ -228,7 +243,7 @@ def _draw_paths(ax, state, title, color, feature_colors, support, labels, xlim):
     ax.tick_params(labelsize=7)
 
 
-def plot_paths(fit, column="double", save=None):
+def plot_paths(fit, column="double", save=None, colors=None, figure_widths=None):
     """Plot regularisation paths for all sub-models in a :class:`PretrainedLasso`.
 
     Produces a 3-row grid: overall model (full width), per-group pretrained
@@ -243,6 +258,12 @@ def plot_paths(fit, column="double", save=None):
         Target figure width — ``"single"`` ≈ 3.5 in, ``"double"`` ≈ 7 in.
     save : str or None, default=None
         File path to save the figure (300 dpi).  No file is written when ``None``.
+    colors : dict or None, default=None
+        Override plot colours for ``"overall"``, ``"pretrain"``, and/or
+        ``"individual"``.  Missing keys fall back to :data:`ptlasso.COLORS`.
+    figure_widths : dict or None, default=None
+        Override figure widths for ``"single"`` and/or ``"double"``.
+        Missing keys fall back to :data:`ptlasso.FIGURE_WIDTHS`.
 
     Returns
     -------
@@ -250,8 +271,9 @@ def plot_paths(fit, column="double", save=None):
     """
     check_is_fitted(fit)
 
+    c = _resolve_colors(colors)
     k = len(fit.groups_)
-    w = FIGURE_WIDTHS.get(column, 7.0)
+    w = _resolve_widths(figure_widths).get(column, 7.0)
     labels = _label_map(fit)
     feature_colors = _feature_color_map(fit)
 
@@ -269,7 +291,7 @@ def plot_paths(fit, column="double", save=None):
         fig.add_subplot(gs[0, :]),
         fit.overall_model_,
         "Overall",
-        COLORS["overall"],
+        c["overall"],
         feature_colors,
         overall_sup,
         labels,
@@ -286,7 +308,7 @@ def plot_paths(fit, column="double", save=None):
             fig.add_subplot(gs[1, col]),
             fit.pretrain_models_[g],
             lbl,
-            COLORS["pretrain"],
+            c["pretrain"],
             feature_colors,
             pre_sup,
             labels,
@@ -296,7 +318,7 @@ def plot_paths(fit, column="double", save=None):
             fig.add_subplot(gs[2, col]),
             fit.individual_models_[g],
             lbl,
-            COLORS["individual"],
+            c["individual"],
             feature_colors,
             ind_sup,
             labels,
@@ -306,9 +328,9 @@ def plot_paths(fit, column="double", save=None):
     # Row labels in left margin
     for row, (text, color) in enumerate(
         [
-            ("Overall", COLORS["overall"]),
-            ("Pretrain", COLORS["pretrain"]),
-            ("Individual", COLORS["individual"]),
+            ("Overall", c["overall"]),
+            ("Pretrain", c["pretrain"]),
+            ("Individual", c["individual"]),
         ]
     ):
         fig.text(

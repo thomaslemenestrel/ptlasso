@@ -36,8 +36,13 @@ from ._support import (
 )
 from ._plot import plot_cv, plot_paths
 from ._simulate import make_data, gaussian_example_data, binomial_example_data
+from ._constants import COLORS, FIGURE_WIDTHS
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version as _version, PackageNotFoundError
+    __version__ = _version("ptlasso")
+except PackageNotFoundError:
+    __version__ = "unknown"
 __all__ = [
     "PretrainedLasso",
     "PretrainedLassoCV",
@@ -50,4 +55,6 @@ __all__ = [
     "make_data",
     "gaussian_example_data",
     "binomial_example_data",
+    "COLORS",
+    "FIGURE_WIDTHS",
 ]

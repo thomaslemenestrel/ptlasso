@@ -209,6 +209,26 @@ plot_paths(model)     # regularisation paths for all sub-models
 
 ---
 
+## Saving and loading models
+
+`PretrainedLasso` and `PretrainedLassoCV` can be serialised with [joblib](https://joblib.readthedocs.io/):
+
+```python
+import joblib
+
+# Save
+joblib.dump(model, "model.pkl")
+
+# Load
+model = joblib.load("model.pkl")
+```
+
+> **Note:** serialised models are tied to the Python and library versions used to create them. For long-term storage, pin your dependencies or retrain from scratch after major version upgrades.
+
+> **Avoid `pickle` directly** — the underlying adelie solver stores C++ objects that are not natively picklable. ptlasso handles this transparently through joblib by converting solver state to plain numpy arrays before serialisation. Using `pickle` directly bypasses this and will raise a `TypeError`.
+
+---
+
 ## API reference
 
 ### `PretrainedLasso`

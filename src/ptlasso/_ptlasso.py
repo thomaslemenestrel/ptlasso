@@ -21,6 +21,48 @@ from ._constants import FAMILIES, LMDA_MODES, PREDICT_MODELS, COEF_MODELS, ALPHA
 
 
 # ------------------------------------------------------------------
+# Serialisation helpers
+# ------------------------------------------------------------------
+
+
+class _StateProxy:
+    """Picklable substitute for an adelie grpnet state object.
+
+    Adelie state objects hold C++ pybind11-bound internals that cannot be
+    pickled.  This class stores only the numpy arrays needed by ptlasso and
+    exposes the same ``betas``, ``lmdas``, and ``intercepts`` attributes so
+    that the rest of the code works without modification.
+    """
+
+    __slots__ = ("betas", "lmdas", "intercepts")
+
+    def __init__(self, betas, lmdas, intercepts):
+        self.betas = betas          # (L, p) or (L, p*K) float64 ndarray
+        self.lmdas = lmdas          # (L,) float64 ndarray
+        self.intercepts = intercepts  # (L,) or (L, K) float64 ndarray
+
+
+def _state_to_proxy(state):
+    """Convert an adelie state object to a picklable :class:`_StateProxy`."""
+    b = state.betas
+    betas = b.toarray() if hasattr(b, "toarray") else np.asarray(b)
+    return _StateProxy(
+        betas=betas,
+        lmdas=np.asarray(state.lmdas),
+        intercepts=np.asarray(state.intercepts),
+    )
+
+
+def _proxify_models(d):
+    """Replace any raw adelie state dicts with proxy dicts in place."""
+    if "overall_model_" in d:
+        d["overall_model_"] = _state_to_proxy(d["overall_model_"])
+    for key in ("pretrain_models_", "individual_models_"):
+        if key in d:
+            d[key] = {g: _state_to_proxy(s) for g, s in d[key].items()}
+
+
+# ------------------------------------------------------------------
 # adelie helpers
 # ------------------------------------------------------------------
 
@@ -583,6 +625,15 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             result["individual"] = _group_coefs(self.individual_models_)
         return result if model == "all" else result[model]
 
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        _proxify_models(d)
+        return d
+
 
 # ------------------------------------------------------------------
 # PretrainedLassoCV
@@ -1002,6 +1053,22 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             f"  overall    : {self.cv_results_overall_:.4f}\n"
             f"  CV results :\n" + "\n".join(rows)
         )
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        # Convert the adelie state refs mirrored directly onto this object.
+        # all_estimators_ / best_estimator_ are PretrainedLasso instances and
+        # go through PretrainedLasso.__getstate__ automatically.
+        _proxify_models(d)
+        return d
+
+    # ------------------------------------------------------------------
+    # get_coef
+    # ------------------------------------------------------------------
 
     def get_coef(self, model="all", **kwargs):
         """Return fitted coefficients from the best estimator.

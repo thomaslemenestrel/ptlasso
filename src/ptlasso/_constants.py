@@ -15,7 +15,7 @@ COEF_MODELS = ("all", "overall", "pretrain", "individual")
 ALPHATYPES = ("best", "varying")
 
 # ------------------------------------------------------------------
-# Colour palette — matches the R package
+# Colour palette 
 # ------------------------------------------------------------------
 
 COLORS = {
