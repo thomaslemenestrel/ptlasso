@@ -4,7 +4,6 @@
 ![versions](https://img.shields.io/pypi/pyversions/ptlasso.svg)
 [![Downloads](https://static.pepy.tech/badge/ptlasso)](https://pepy.tech/project/ptlasso)
 [![Downloads](https://static.pepy.tech/badge/ptlasso/month)](https://pepy.tech/project/ptlasso)
-![GitHub Release](https://img.shields.io/github/v/release/tlemenestrel/ptlasso)
 
 Python implementation of the **Pretrained Lasso** — a two-step procedure for fitting sparse linear models when samples belong to distinct groups, leveraging shared structure across groups via pretraining.
 
