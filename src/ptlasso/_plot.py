@@ -31,14 +31,23 @@ def _cv_ylabel(family):
 
 
 def _active_features(fit):
-    """Integer indices of every feature that is nonzero in any sub-model."""
+    """Integer indices of every feature that is nonzero in any sub-model.
+
+    Uses each model's CV-selected lambda index (not the last / least
+    regularised one) so that the feature-colour palette matches the
+    regularisation paths shown in ``plot_paths``.
+    """
     coef = fit.overall_coef_
     # overall_coef_ is (p,) for gaussian/binomial, (p, K) for multinomial
     overall = set(np.where(np.reshape(coef, (fit.n_features_in_, -1)).any(axis=1))[0])
+    pre_idxs = getattr(fit, "pretrain_lmda_idx_", {})
+    ind_idxs = getattr(fit, "individual_lmda_idx_", {})
     group_active = set()
     for g in fit.groups_:
-        group_active |= set(np.where(_betas_dense(fit.pretrain_models_[g])[-1] != 0)[0])
-        group_active |= set(np.where(_betas_dense(fit.individual_models_[g])[-1] != 0)[0])
+        pre_i = pre_idxs.get(g, -1)
+        ind_i = ind_idxs.get(g, -1)
+        group_active |= set(np.where(_betas_dense(fit.pretrain_models_[g])[pre_i] != 0)[0])
+        group_active |= set(np.where(_betas_dense(fit.individual_models_[g])[ind_i] != 0)[0])
     return sorted(overall | group_active)
 
 
@@ -284,13 +293,30 @@ def plot_paths(fit, column="double", save=None, colors=None, figure_widths=None)
         np.where(np.reshape(fit.overall_coef_, (fit.n_features_in_, -1)).any(axis=1))[0]
     )
 
+    # The overall model was trained on [onehot | X]; strip the onehot columns
+    # from betas so that _draw_paths sees only the p X-feature coefficients.
+    n_onehot = getattr(fit, "_n_onehot_", 0)
+
+    class _StrippedOverallState:
+        """Thin view of the overall model state with onehot columns removed."""
+
+        def __init__(self, state, n_skip):
+            raw = _betas_dense(state)  # (L, k-1+p)
+            self.betas = raw[:, n_skip:]  # (L, p)
+            self.lmdas = state.lmdas
+            self.intercepts = state.intercepts
+
+    overall_state_for_plot = (
+        _StrippedOverallState(fit.overall_model_, n_onehot) if n_onehot > 0 else fit.overall_model_
+    )
+
     fig = plt.figure(figsize=(w, w * 0.42 * 3))
     gs = gridspec.GridSpec(3, k, figure=fig, hspace=0.7, wspace=0.45)
 
     # Row 0: overall model (spans all columns)
     _draw_paths(
         fig.add_subplot(gs[0, :]),
-        fit.overall_model_,
+        overall_state_for_plot,
         "Overall",
         c["overall"],
         feature_colors,
@@ -300,10 +326,14 @@ def plot_paths(fit, column="double", save=None, colors=None, figure_widths=None)
     )
 
     # Rows 1 & 2: per-group pretrain and individual
+    pre_idxs = getattr(fit, "pretrain_lmda_idx_", {})
+    ind_idxs = getattr(fit, "individual_lmda_idx_", {})
     for col, g in enumerate(fit.groups_):
         lbl = fit._label(g)
-        pre_sup = set(np.where(_betas_dense(fit.pretrain_models_[g])[-1] != 0)[0])
-        ind_sup = set(np.where(_betas_dense(fit.individual_models_[g])[-1] != 0)[0])
+        pre_i = pre_idxs.get(g, -1)
+        ind_i = ind_idxs.get(g, -1)
+        pre_sup = set(np.where(_betas_dense(fit.pretrain_models_[g])[pre_i] != 0)[0])
+        ind_sup = set(np.where(_betas_dense(fit.individual_models_[g])[ind_i] != 0)[0])
 
         _draw_paths(
             fig.add_subplot(gs[1, col]),

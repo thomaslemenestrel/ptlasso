@@ -19,6 +19,24 @@ def _nonzero(fit, state, lmda_idx):
     return np.where(coef != 0)[0]
 
 
+def _nonzero_overall(fit, lmda_idx):
+    """0-based X-feature indices that are nonzero in the overall model.
+
+    The overall model is trained on ``[onehot | X]`` when group intercepts
+    are enabled (``fit._n_onehot_ > 0``).  The first ``_n_onehot_`` columns
+    of the coefficient vector correspond to the group-dummy variables and must
+    be skipped so that returned indices refer to the original X features.
+    """
+    n_skip = getattr(fit, "_n_onehot_", 0)
+    coef = _coef_at(fit.overall_model_, lmda_idx)
+    if fit.n_classes_ is not None:
+        p_aug = fit.n_features_in_ + n_skip
+        coef_mat = coef.reshape(p_aug, fit.n_classes_, order="F")
+        coef_x = coef_mat[n_skip:, :]
+        return np.where(np.any(coef_x != 0, axis=1))[0]
+    return np.where(coef[n_skip:] != 0)[0]
+
+
 def _resolve(fit, indices):
     """Return feature names for indices if available, else return the indices."""
     names = getattr(fit, "feature_names_in_", None)
@@ -64,7 +82,7 @@ def get_overall_support(fit, lmda_idx=None):
     """
     check_is_fitted(fit)
     idx = lmda_idx if lmda_idx is not None else fit.overall_lmda_idx_
-    return _resolve(fit, _nonzero(fit, fit.overall_model_, idx))
+    return _resolve(fit, _nonzero_overall(fit, idx))
 
 
 def get_pretrain_support(fit, lmda_idx=None, groups=None, include_overall=True, common_only=False):
@@ -74,7 +92,9 @@ def get_pretrain_support(fit, lmda_idx=None, groups=None, include_overall=True, 
     ----------
     fit : PretrainedLasso or PretrainedLassoCV
     lmda_idx : int or None
-        Lambda index for the pretrained group models.  Defaults to -1.
+        Lambda index for the pretrained group models.  When ``None`` (default),
+        each group uses its own CV-selected index (``pretrain_lmda_idx_``),
+        matching the lambda used by ``predict``.
     groups : array-like or None
         Subset of group labels to consider.  Default is all groups.
     include_overall : bool, default=True
@@ -89,14 +109,22 @@ def get_pretrain_support(fit, lmda_idx=None, groups=None, include_overall=True, 
     """
     check_is_fitted(fit)
     groups = fit.groups_ if groups is None else np.asarray(groups)
-    idx = -1 if lmda_idx is None else lmda_idx
 
     base = (
-        _nonzero(fit, fit.overall_model_, fit.overall_lmda_idx_)
+        _nonzero_overall(fit, fit.overall_lmda_idx_)
         if include_overall and fit.alpha < 1
         else np.array([], dtype=int)
     )
-    per_group = [_nonzero(fit, fit.pretrain_models_[g], idx) for g in groups]
+    # Use each group's CV-selected lambda when lmda_idx is not specified.
+    per_group_idxs = getattr(fit, "pretrain_lmda_idx_", {})
+    per_group = [
+        _nonzero(
+            fit,
+            fit.pretrain_models_[g],
+            lmda_idx if lmda_idx is not None else per_group_idxs.get(g, -1),
+        )
+        for g in groups
+    ]
 
     return _resolve(fit, _combine(per_group, base, common_only, len(groups)))
 
@@ -108,7 +136,9 @@ def get_individual_support(fit, lmda_idx=None, groups=None, common_only=False):
     ----------
     fit : PretrainedLasso or PretrainedLassoCV
     lmda_idx : int or None
-        Lambda index for the individual group models.  Defaults to -1.
+        Lambda index for the individual group models.  When ``None`` (default),
+        each group uses its own CV-selected index (``individual_lmda_idx_``),
+        matching the lambda used by ``predict``.
     groups : array-like or None
         Subset of group labels to consider.  Default is all groups.
     common_only : bool, default=False
@@ -120,9 +150,16 @@ def get_individual_support(fit, lmda_idx=None, groups=None, common_only=False):
     """
     check_is_fitted(fit)
     groups = fit.groups_ if groups is None else np.asarray(groups)
-    idx = -1 if lmda_idx is None else lmda_idx
 
-    per_group = [_nonzero(fit, fit.individual_models_[g], idx) for g in groups]
+    per_group_idxs = getattr(fit, "individual_lmda_idx_", {})
+    per_group = [
+        _nonzero(
+            fit,
+            fit.individual_models_[g],
+            lmda_idx if lmda_idx is not None else per_group_idxs.get(g, -1),
+        )
+        for g in groups
+    ]
 
     return _resolve(fit, _combine(per_group, np.array([], dtype=int), common_only, len(groups)))
 
@@ -140,7 +177,8 @@ def get_pretrain_support_split(fit, lmda_idx=None, groups=None):
     ----------
     fit : PretrainedLasso or PretrainedLassoCV
     lmda_idx : int or None
-        Lambda index for the group models.  Defaults to -1.
+        Lambda index for the group models.  When ``None`` (default), each
+        group uses its own CV-selected index (``pretrain_lmda_idx_``).
     groups : array-like or None
         Subset of group labels.  Default is all groups.
 
@@ -151,11 +189,12 @@ def get_pretrain_support_split(fit, lmda_idx=None, groups=None):
     """
     check_is_fitted(fit)
     groups = fit.groups_ if groups is None else np.asarray(groups)
-    idx = -1 if lmda_idx is None else lmda_idx
 
-    overall_idx = set(_nonzero(fit, fit.overall_model_, fit.overall_lmda_idx_).tolist())
+    per_group_idxs = getattr(fit, "pretrain_lmda_idx_", {})
+    overall_idx = set(_nonzero_overall(fit, fit.overall_lmda_idx_).tolist())
     stage2_idx = set()
     for g in groups:
+        idx = lmda_idx if lmda_idx is not None else per_group_idxs.get(g, -1)
         stage2_idx |= set(_nonzero(fit, fit.pretrain_models_[g], idx).tolist())
 
     common_idx = np.sort(np.array(list(overall_idx), dtype=int))

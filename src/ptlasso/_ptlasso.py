@@ -8,6 +8,10 @@ PretrainedLassoCV
     Same estimator with cross-validation over the pretraining strength alpha.
 """
 
+import contextlib
+import os
+import time
+
 import adelie as ad
 import numpy as np
 
@@ -17,7 +21,15 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 from ._base import BasePretrainedLasso
-from ._constants import FAMILIES, LMDA_MODES, PREDICT_MODELS, COEF_MODELS, ALPHATYPES
+from ._constants import (
+    FAMILIES,
+    LMDA_MODES,
+    PREDICT_MODELS,
+    PREDICT_TYPES,
+    COEF_MODELS,
+    ALPHATYPES,
+    DEFAULT_ALPHAS,
+)
 
 
 # ------------------------------------------------------------------
@@ -65,6 +77,27 @@ def _proxify_models(d):
 # ------------------------------------------------------------------
 # adelie helpers
 # ------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _silence():
+    """Suppress stdout/stderr at the file-descriptor level.
+
+    Redirects fds 1 and 2 to /dev/null so output from C extensions
+    (such as adelie's solver messages) is always swallowed.
+    """
+    null_fd = os.open(os.devnull, os.O_WRONLY)
+    saved = [os.dup(1), os.dup(2)]
+    try:
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    finally:
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
+        os.close(null_fd)
 
 
 def _coef_at(state, lmda_idx):
@@ -136,6 +169,28 @@ def _apply_link(eta, family):
     if family == "binomial":
         return _sigmoid(eta)
     return eta  # gaussian: identity
+
+
+def _eta_to_output(eta, family, type):
+    """Convert a linear predictor to the requested output type.
+
+    Parameters
+    ----------
+    eta : ndarray
+        Linear predictor, shape ``(n,)`` or ``(n, K)`` for multinomial.
+    family : str
+        One of ``"gaussian"``, ``"binomial"``, ``"multinomial"``.
+    type : {"response", "link", "class"}
+    """
+    if type == "link":
+        return eta
+    proba = _apply_link(eta, family)
+    if type == "response":
+        return proba
+    # type == "class"
+    if family == "binomial":
+        return (proba >= 0.5).astype(int)
+    return proba.argmax(axis=1).astype(int)  # multinomial
 
 
 def _model_score(y_true, y_pred, family):
@@ -231,8 +286,13 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         Number of lambdas in the regularisation path.
     min_ratio : float, default=0.01
         Ratio of the smallest to largest lambda on the path.
-    verbose : bool, default=False
-        Whether to display adelie's progress bar during fitting.
+    verbose : bool, default=True
+        Whether to display fitting progress and a summary after training.
+        Adelie's internal output is always suppressed regardless of this setting.
+    n_threads : int, default=1
+        Number of threads passed to adelie's solver.  Set to a higher value
+        to parallelise the coordinate descent within each model fit.
+        ``-1`` uses all available CPU cores (``os.cpu_count()``).
 
     Attributes
     ----------
@@ -247,8 +307,12 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         Index into ``overall_model_.lmdas`` for the selected lambda.
     pretrain_models_ : dict {group -> adelie state}
         Per-group fitted Lasso models (stage 2, with pretraining offset).
+    pretrain_lmda_idx_ : dict {group -> int}
+        CV-selected lambda index for each pretrain group model (``lambda.min``).
     individual_models_ : dict {group -> adelie state}
         Per-group fitted Lasso models without any pretraining offset.
+    individual_lmda_idx_ : dict {group -> int}
+        CV-selected lambda index for each individual group model (``lambda.min``).
     groups_ : ndarray
         Unique group labels seen during fit.
     n_features_in_ : int
@@ -273,7 +337,8 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         fit_intercept=True,
         lmda_path_size=100,
         min_ratio=0.01,
-        verbose=False,
+        verbose=True,
+        n_threads=1,
     ):
         self.alpha = alpha
         self.family = family
@@ -282,6 +347,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         self.lmda_path_size = lmda_path_size
         self.min_ratio = min_ratio
         self.verbose = verbose
+        self.n_threads = n_threads
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -315,20 +381,142 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             return self.feature_names_in_[indices]
         return indices
 
+    def _make_onehot(self, groups):
+        """Build (n, k-1) group indicator matrix.
+
+        The first group in ``self.groups_`` is the reference category (all
+        zeros), matching R's ``model.matrix(~groups - 1)[, 2:k]`` convention.
+        These columns are prepended to X in the overall model with zero
+        penalty so they act as free group-specific intercepts (R's
+        ``group.intercepts = TRUE``).
+        """
+        k = len(self.groups_)
+        n = len(groups)
+        if k <= 1:
+            return np.empty((n, 0), dtype=np.float64, order="F")
+        onehot = np.zeros((n, k - 1), dtype=np.float64, order="F")
+        for col, g in enumerate(self.groups_[1:]):  # groups_[0] is reference
+            onehot[groups == g, col] = 1.0
+        return onehot
+
     def _grpnet_kwargs(self):
+        n_threads = os.cpu_count() if self.n_threads == -1 else self.n_threads
         return dict(
             alpha=1,  # pure lasso (no group penalty mixing)
             intercept=self.fit_intercept,
             lmda_path_size=self.lmda_path_size,
             min_ratio=self.min_ratio,
-            progress_bar=self.verbose,
+            progress_bar=False,  # replaced by ptlasso's own tqdm output
+            n_threads=n_threads,
         )
 
-    def _overall_eta(self, X):
-        """Overall linear predictor at the selected lambda."""
-        return _eta_from_state(
-            self.overall_model_, X, self.overall_lmda_idx_, self.family, self.n_classes_
+    def _overall_eta(self, X, groups):
+        """Overall linear predictor at the selected lambda.
+
+        The overall model was trained on ``[onehot | X]``, so we reconstruct
+        the augmented matrix before computing the linear predictor.  This
+        matches R's predict behaviour where group-intercept columns are always
+        included.
+        """
+        onehot = self._make_onehot(groups)
+        X_aug = (
+            np.asfortranarray(np.hstack([onehot, X]))
+            if onehot.shape[1] > 0
+            else np.asfortranarray(X)
         )
+        return _eta_from_state(
+            self.overall_model_, X_aug, self.overall_lmda_idx_, self.family, self.n_classes_
+        )
+
+    def _compute_oof_eta(self, X_overall, y, overall_pf, groups):
+        """Compute out-of-fold linear predictors for the overall model.
+
+        Mirrors R's ``cv.glmnet(..., keep=TRUE)`` which stores prevalidated
+        (out-of-fold) predictions.  Each sample's prediction comes from a
+        model that never saw that sample during training, so the offset used
+        in stage-2 fitting is free of in-sample optimism.
+
+        Parameters
+        ----------
+        X_overall : (n, k-1+p) ndarray
+            Augmented feature matrix including group-indicator columns.
+        y : (n,) ndarray
+            Target values.
+        overall_pf : (k-1+p,) ndarray
+            Penalty factors (0 for group-dummy columns, 1 for features).
+        groups : (n,) ndarray
+            Group membership for each sample, used to create stratified folds.
+
+        Returns
+        -------
+        oof_eta : (n,) or (n, K) ndarray
+            Out-of-fold linear predictors in the same shape as the overall
+            model's ``_eta_from_state`` output.
+        """
+        n = X_overall.shape[0]
+        lamhat = float(self.overall_model_.lmdas[self.overall_lmda_idx_])
+
+        if self.family == "multinomial":
+            oof_eta = np.zeros((n, self.n_classes_))
+        else:
+            oof_eta = np.zeros(n)
+
+        # Determine number of folds: cap at min group size, floor at 2.
+        n_folds = min(10, min(int(np.sum(groups == g)) for g in self.groups_))
+        n_folds = max(2, n_folds)
+
+        splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        for train_idx, test_idx in splitter.split(X_overall, groups):
+            X_tr = np.asfortranarray(X_overall[train_idx])
+            y_tr = y[train_idx]
+            X_te = np.asfortranarray(X_overall[test_idx])
+
+            glm_fold = _make_glm(self.family, y_tr)
+            with _silence():
+                fold_state = ad.grpnet(X_tr, glm_fold, penalty=overall_pf, **self._grpnet_kwargs())
+
+            # Find the lambda in this fold's path closest to the full-data lamhat.
+            lmdas = np.asarray(fold_state.lmdas)
+            lmda_idx = int(np.argmin(np.abs(lmdas - lamhat))) if len(lmdas) > 0 else 0
+
+            oof_eta[test_idx] = _eta_from_state(
+                fold_state, X_te, lmda_idx, self.family, self.n_classes_
+            )
+
+        return oof_eta
+
+    # ------------------------------------------------------------------
+    # Progress / display helpers
+    # ------------------------------------------------------------------
+
+    def _support_size(self, state, lmda_idx):
+        """Number of nonzero features in a fitted state at a given lambda index."""
+        c = _coef_at(state, lmda_idx)
+        if self.n_classes_ is not None:
+            c = c.reshape(self.n_features_in_, self.n_classes_, order="F")
+            return int(np.sum(np.any(c != 0, axis=1)))
+        return int(np.sum(c != 0))
+
+    def _print_fit_summary(self, elapsed):
+        SEP = "─" * 54
+        if self.family == "multinomial":
+            n_ov = int(np.sum(np.any(self.overall_coef_ != 0, axis=1)))
+        else:
+            n_ov = int(np.sum(self.overall_coef_ != 0))
+        pre_parts = "   ".join(
+            f"{self._label(g)}: |S|={self._support_size(self.pretrain_models_[g], self.pretrain_lmda_idx_[g])}"
+            for g in self.groups_
+        )
+        ind_parts = "   ".join(
+            f"{self._label(g)}: |S|={self._support_size(self.individual_models_[g], self.individual_lmda_idx_[g])}"
+            for g in self.groups_
+        )
+        print(SEP)
+        print(f"  {'overall':<13}|S| = {n_ov}")
+        print(f"  {'pretrain':<13}{pre_parts}")
+        print(f"  {'individual':<13}{ind_parts}")
+        print(SEP)
+        print(f"  Fitted in {elapsed:.1f}s\n")
 
     # ------------------------------------------------------------------
     # fit
@@ -360,6 +548,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         self : PretrainedLasso
             Fitted estimator.
         """
+        t0 = time.time()
         self._validate_params()
 
         if feature_names is None and hasattr(X, "columns"):
@@ -410,35 +599,79 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             int(np.asarray(y, dtype=int).max()) + 1 if self.family == "multinomial" else None
         )
 
+        if self.verbose:
+            k = len(self.groups_)
+            glabels = [str(self._label(g)) for g in self.groups_]
+            gstr = ", ".join(glabels[:4]) + (f" +{k - 4} more" if k > 4 else "")
+            print(
+                f"\nPretrainedLasso  {self.family}  ·  {k} groups ({gstr})"
+                f"  ·  {self.n_features_in_} features  ·  α={self.alpha}"
+            )
+
+        # ----------------------------------------------------------
+        # Build augmented X for the overall model (group intercepts).
+        # Matches R's group.intercepts = TRUE: one-hot group dummies (k-1
+        # columns, first group = reference) are prepended to X with zero
+        # penalty so they act as free intercepts per group.
+        # ----------------------------------------------------------
+        onehot = self._make_onehot(groups)  # (n, k-1)
+        n_onehot = onehot.shape[1]  # = k-1 >= 1
+        self._n_onehot_ = n_onehot
+        X_overall = (
+            np.asfortranarray(np.hstack([onehot, X])) if n_onehot > 0 else np.asfortranarray(X)
+        )
+        # Zero penalty for group-dummy columns; unit penalty for X features.
+        overall_pf = np.concatenate([np.zeros(n_onehot), np.ones(self.n_features_in_)])
+
         # ----------------------------------------------------------
         # Step 1: overall model (lambda selected by CV)
         # ----------------------------------------------------------
         glm_all = _make_glm(self.family, y)
-        cv_overall = ad.cv_grpnet(X, glm_all, **self._grpnet_kwargs())
+        if self.verbose:
+            print("  [1/2] Overall model (CV) ...", end="", flush=True)
+            _t1 = time.time()
+        with _silence():
+            cv_overall = ad.cv_grpnet(
+                X_overall, glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+            )
 
-        self.overall_lmda_idx_ = (
-            cv_overall.best_idx
-            if self.overall_lambda == "lambda.min"
-            else _lmda_1se_idx(cv_overall)
-        )
-        self.overall_model_ = cv_overall.fit(X, glm_all, **self._grpnet_kwargs())
+            self.overall_lmda_idx_ = (
+                cv_overall.best_idx
+                if self.overall_lambda == "lambda.min"
+                else _lmda_1se_idx(cv_overall)
+            )
+            self.overall_model_ = cv_overall.fit(
+                X_overall, glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+            )
 
+        # Extract X-feature coefficients only (skip the k-1 onehot columns).
+        # overall_coef_ has shape (p,) or (p, K) — identical to the no-group-
+        # intercepts case from the caller's perspective.
         if self.family == "multinomial":
             flat = _coef_at(self.overall_model_, self.overall_lmda_idx_)
-            self.overall_coef_ = flat.reshape(self.n_features_in_, self.n_classes_, order="F")
+            p_aug = X_overall.shape[1]
+            coef_mat = flat.reshape(p_aug, self.n_classes_, order="F")
+            self.overall_coef_ = coef_mat[n_onehot:, :]  # (p, K)
         else:
-            self.overall_coef_ = _coef_at(self.overall_model_, self.overall_lmda_idx_)
+            coef_full = _coef_at(self.overall_model_, self.overall_lmda_idx_)
+            self.overall_coef_ = coef_full[n_onehot:]  # (p,)
             self.overall_intercept_ = float(self.overall_model_.intercepts[self.overall_lmda_idx_])
+
+        # ----------------------------------------------------------
+        # Compute OOF overall linear predictor (matches R's keep=TRUE).
+        # Using in-sample predictions as the offset introduces optimism:
+        # the overall model has already seen the training samples, so its
+        # predictions are sharper than true held-out predictions.  OOF
+        # predictions avoid this leakage.
+        # ----------------------------------------------------------
+        preval_offset = self._compute_oof_eta(X_overall, y, overall_pf, groups)
 
         # ----------------------------------------------------------
         # Step 2: per-group models
         # ----------------------------------------------------------
-        # Offset = (1 - alpha) * overall linear predictor (eta space, before link).
-        # Matches R convention: alpha=0 → full pretraining, alpha=1 → individual.
-        # Penalty factor: features NOT in the overall support get penalty 1/alpha,
-        # steering the group model to prefer features already selected overall.
-        overall_eta = self._overall_eta(X)
-
+        # Penalty factor: features NOT in the overall X-support get penalty
+        # 1/alpha, steering the group model to prefer features already
+        # selected overall.  Matches R's fac = rep(1/alpha, p); fac[supall] = 1.
         if self.family == "multinomial":
             overall_support = np.where(np.any(self.overall_coef_ != 0, axis=1))[0]
         else:
@@ -448,19 +681,56 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         pf = np.full(self.n_features_in_, 1.0 / _alpha_pf)
         pf[overall_support] = 1.0
 
-        self.pretrain_models_ = {}
-        self.individual_models_ = {}
+        if self.verbose:
+            if self.family == "multinomial":
+                n_ov = int(np.sum(np.any(self.overall_coef_ != 0, axis=1)))
+            else:
+                n_ov = int(np.sum(self.overall_coef_ != 0))
+            print(f" done  ({time.time() - _t1:.1f}s)  |S|={n_ov}")
 
-        for g in self.groups_:
+        self.pretrain_models_ = {}
+        self.pretrain_lmda_idx_ = {}
+        self.individual_models_ = {}
+        self.individual_lmda_idx_ = {}
+
+        if self.verbose:
+            try:
+                from tqdm import tqdm as _tqdm
+
+                group_iter = _tqdm(
+                    self.groups_, desc="  [2/2] Group models", unit="group", leave=True
+                )
+            except ImportError:
+                print("  [2/2] Group models")
+                group_iter = self.groups_
+        else:
+            group_iter = self.groups_
+
+        for g in group_iter:
             mask = groups == g
             X_g = np.asfortranarray(X[mask])
             glm_g = _make_glm(self.family, y[mask])
-            offset = np.asfortranarray((1 - self.alpha) * overall_eta[mask])
+            # OOF offset: each sample's overall prediction came from a model
+            # trained without that sample — mirrors R's use of fit.preval.
+            offset = np.asfortranarray((1 - self.alpha) * preval_offset[mask])
 
-            self.pretrain_models_[g] = ad.grpnet(
-                X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
-            )
-            self.individual_models_[g] = ad.grpnet(X_g, glm_g, **self._grpnet_kwargs())
+            # Mirrors R's cv.glmnet for per-group models: select lambda by CV
+            # (lambda.min), then refit on the full group data at that lambda.
+            with _silence():
+                cv_pre = ad.cv_grpnet(
+                    X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                )
+                self.pretrain_lmda_idx_[g] = cv_pre.best_idx
+                self.pretrain_models_[g] = cv_pre.fit(
+                    X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                )
+
+                cv_ind = ad.cv_grpnet(X_g, glm_g, **self._grpnet_kwargs())
+                self.individual_lmda_idx_[g] = cv_ind.best_idx
+                self.individual_models_[g] = cv_ind.fit(X_g, glm_g, **self._grpnet_kwargs())
+
+        if self.verbose:
+            self._print_fit_summary(time.time() - t0)
 
         return self
 
@@ -468,7 +738,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
     # predict / score / evaluate
     # ------------------------------------------------------------------
 
-    def predict(self, X, groups, model="pretrain", lmda_idx=None):
+    def predict(self, X, groups, model="pretrain", type="response", lmda_idx=None):
         """Predict target values.
 
         Parameters
@@ -476,12 +746,29 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         X : array-like of shape (n_samples, n_features)
         groups : array-like of shape (n_samples,)
         model : {"pretrain", "individual", "overall"}, default="pretrain"
+        type : {"response", "link", "class"}, default="response"
+            Scale of the returned predictions.
+
+            ``"response"`` — fitted values on the response scale: probabilities
+            for binomial/multinomial, fitted values for gaussian.
+
+            ``"link"`` — raw linear predictor before the link function
+            (``η = Xβ + intercept``).  For gaussian this is identical to
+            ``"response"``.
+
+            ``"class"`` — predicted class label: ``0`` or ``1`` for binomial
+            (threshold 0.5), integer argmax for multinomial.  Not valid for
+            gaussian.
         lmda_idx : int or None
-            Lambda index for group models.  None uses the last fitted lambda.
+            Lambda index for group models.  ``None`` uses the CV-selected
+            lambda for each group (``lambda.min``, matching R).
 
         Returns
         -------
-        y_pred : ndarray, shape (n,) or (n, K) for multinomial
+        y_pred : ndarray
+            Shape ``(n,)`` for gaussian/binomial and for multinomial
+            ``"class"``.  Shape ``(n, K)`` for multinomial ``"response"``
+            or ``"link"``.
         """
         check_is_fitted(self)
         X = check_array(X, dtype=np.float64, order="F")
@@ -489,6 +776,10 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
         if model not in PREDICT_MODELS:
             raise ValueError(f"model must be one of {PREDICT_MODELS}, got '{model}'")
+        if type not in PREDICT_TYPES:
+            raise ValueError(f"type must be one of {PREDICT_TYPES}, got '{type}'")
+        if type == "class" and self.family == "gaussian":
+            raise ValueError("type='class' is not valid for family='gaussian'")
         if len(groups) != X.shape[0]:
             raise ValueError(f"groups has {len(groups)} elements but X has {X.shape[0]} samples")
         unknown = set(np.unique(groups)) - set(self.groups_)
@@ -496,34 +787,31 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             raise ValueError(f"predict received groups not seen during fit: {unknown}")
 
         if model == "overall":
-            return _apply_link(self._overall_eta(X), self.family)
+            return _eta_to_output(self._overall_eta(X, groups), self.family, type)
 
-        idx = -1 if lmda_idx is None else lmda_idx
         n_out = (X.shape[0], self.n_classes_) if self.family == "multinomial" else (X.shape[0],)
-        y_pred = np.empty(n_out)
+        eta_out = np.empty(n_out)
 
         # Overall eta is only needed when combining with a group model (pretrain).
-        eta_ov = self._overall_eta(X) if model == "pretrain" else None
+        eta_ov = self._overall_eta(X, groups) if model == "pretrain" else None
 
         for g in self.groups_:
             mask = groups == g
             X_g = X[mask]
 
             if model == "pretrain":
-                # Total eta = (1-alpha) * eta_overall + eta_group.
-                # The group model was trained with offset = (1-alpha) * eta_overall,
-                # so its eta already captures the residual.
+                g_idx = self.pretrain_lmda_idx_.get(g, -1) if lmda_idx is None else lmda_idx
                 eta_group = _eta_from_state(
-                    self.pretrain_models_[g], X_g, idx, self.family, self.n_classes_
+                    self.pretrain_models_[g], X_g, g_idx, self.family, self.n_classes_
                 )
-                y_pred[mask] = _apply_link((1 - self.alpha) * eta_ov[mask] + eta_group, self.family)
+                eta_out[mask] = (1 - self.alpha) * eta_ov[mask] + eta_group
             else:
-                eta = _eta_from_state(
-                    self.individual_models_[g], X_g, idx, self.family, self.n_classes_
+                g_idx = self.individual_lmda_idx_.get(g, -1) if lmda_idx is None else lmda_idx
+                eta_out[mask] = _eta_from_state(
+                    self.individual_models_[g], X_g, g_idx, self.family, self.n_classes_
                 )
-                y_pred[mask] = _apply_link(eta, self.family)
 
-        return y_pred
+        return _eta_to_output(eta_out, self.family, type)
 
     def score(self, X, y, groups):
         """Return a scalar performance metric using the pretrained model.
@@ -597,7 +885,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
         group_sizes = {}
         for g in self.groups_:
-            c = _coef_at(self.pretrain_models_[g], -1)
+            c = _coef_at(self.pretrain_models_[g], self.pretrain_lmda_idx_.get(g, -1))
             if self.family == "multinomial":
                 c = c.reshape(self.n_features_in_, self.n_classes_, order="F")
                 group_sizes[self._label(g)] = int(np.sum(np.any(c != 0, axis=1)))
@@ -638,16 +926,16 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         if model not in COEF_MODELS:
             raise ValueError(f"model must be one of {COEF_MODELS}, got '{model}'")
         check_is_fitted(self)
-        idx = -1 if lmda_idx is None else lmda_idx
 
-        def _group_coefs(models):
-            return {
-                self._label(g): {
-                    "coef": _coef_at(state, idx),
-                    "intercept": np.asarray(state.intercepts[idx]).ravel(),
+        def _group_coefs(models, lmda_idxs):
+            result = {}
+            for g, state in models.items():
+                use_idx = lmda_idxs.get(g, -1) if lmda_idx is None else lmda_idx
+                result[self._label(g)] = {
+                    "coef": _coef_at(state, use_idx),
+                    "intercept": np.asarray(state.intercepts[use_idx]).ravel(),
                 }
-                for g, state in models.items()
-            }
+            return result
 
         result = {}
         if model in ("all", "overall"):
@@ -658,9 +946,9 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 ).ravel(),
             }
         if model in ("all", "pretrain"):
-            result["pretrain"] = _group_coefs(self.pretrain_models_)
+            result["pretrain"] = _group_coefs(self.pretrain_models_, self.pretrain_lmda_idx_)
         if model in ("all", "individual"):
-            result["individual"] = _group_coefs(self.individual_models_)
+            result["individual"] = _group_coefs(self.individual_models_, self.individual_lmda_idx_)
         return result if model == "all" else result[model]
 
     # ------------------------------------------------------------------
@@ -701,11 +989,16 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         Number of lambdas in the regularisation path.
     min_ratio : float, default=0.01
         Ratio of the smallest to largest lambda on the path.
-    verbose : bool, default=False
-        Whether to display adelie's progress bar during fitting.
+    verbose : bool, default=True
+        Whether to display fitting progress and a summary after training.
+        Adelie's internal output is always suppressed regardless of this setting.
     foldid : array-like of int or None, default=None
         Fold assignments, one integer per sample.  When provided, overrides
         the internal ``StratifiedKFold`` splitter.
+    n_threads : int, default=1
+        Number of threads passed to adelie's solver.  Set to a higher value
+        to parallelise the coordinate descent within each model fit.
+        ``-1`` uses all available CPU cores (``os.cpu_count()``).
     scoring : str, callable, or None, default=None
         CV criterion used to select the best alpha.  All values follow the
         **higher = better** convention (matching sklearn).
@@ -756,11 +1049,9 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
     *Journal of the Royal Statistical Society Series B*, qkaf050.
     """
 
-    _DEFAULT_ALPHAS = [0.0, 0.25, 0.5, 0.75, 1.0]
-
     def __init__(
         self,
-        alphas=None,
+        alphas=DEFAULT_ALPHAS,
         cv=5,
         alphahat_choice="overall",
         family="gaussian",
@@ -768,9 +1059,10 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         fit_intercept=True,
         lmda_path_size=100,
         min_ratio=0.01,
-        verbose=False,
+        verbose=True,
         foldid=None,
         scoring=None,
+        n_threads=1,
     ):
         self.alphas = alphas
         self.cv = cv
@@ -783,16 +1075,14 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         self.verbose = verbose
         self.foldid = foldid
         self.scoring = scoring
+        self.n_threads = n_threads
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_alphas(self):
-        return list(self.alphas) if self.alphas is not None else self._DEFAULT_ALPHAS
-
     def _validate_params(self):
-        alphas = self._get_alphas()
+        alphas = self.alphas
         bad = [a for a in alphas if not (0.0 <= a <= 1.0)]
         if bad:
             raise ValueError(f"All alphas must be in [0, 1], got {bad}")
@@ -819,6 +1109,10 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                     f"got '{self.scoring}'"
                 )
 
+    def _get_alphas(self):
+        """Return the list of alpha candidates."""
+        return list(self.alphas if self.alphas is not None else DEFAULT_ALPHAS)
+
     def _base_estimator(self, alpha):
         """Return a configured PretrainedLasso for a given alpha."""
         return PretrainedLasso(
@@ -828,7 +1122,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             fit_intercept=self.fit_intercept,
             lmda_path_size=self.lmda_path_size,
             min_ratio=self.min_ratio,
-            verbose=self.verbose,
+            verbose=False,  # CV sub-fits are silent; PretrainedLassoCV owns the progress bar
+            n_threads=self.n_threads,
         )
 
     def _fold_iter(self, X, groups):
@@ -846,6 +1141,37 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         else:
             splitter = StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=0)
             yield from splitter.split(X, groups)
+
+    # ------------------------------------------------------------------
+    # Progress / display helpers
+    # ------------------------------------------------------------------
+
+    def _print_cv_summary(self, elapsed, n_cv_folds):
+        SEP = "─" * 54
+        print(SEP)
+        print(f"    {'α':<8} {'CV loss':<12} {'±SE'}")
+        print(f"  {'─' * 34}")
+        for a in self.alphalist_:
+            marker = "►" if a == self.alpha_ else " "
+            print(f" {marker}  {a:<8.2f} {self.cv_results_[a]:<12.4f} {self.cv_results_se_[a]:.4f}")
+        print(f"  {'─' * 34}")
+        print(f"  {'individual':<13}{self.cv_results_individual_:.4f}")
+        print(f"  {'overall':<13}{self.cv_results_overall_:.4f}")
+        print(SEP)
+        best = self.best_estimator_
+        stage2 = set()
+        for g in self.groups_:
+            c = _coef_at(best.pretrain_models_[g], best.pretrain_lmda_idx_[g])
+            if best.n_classes_ is not None:
+                c = c.reshape(best.n_features_in_, best.n_classes_, order="F")
+                stage2 |= set(int(i) for i in np.where(np.any(c != 0, axis=1))[0])
+            else:
+                stage2 |= set(int(i) for i in np.where(c != 0)[0])
+        print(
+            f"  Best α = {self.alpha_:.2f}   |S| = {len(stage2)}"
+            f"   Fitted in {elapsed:.1f}s"
+            f"  ({len(self.alphalist_)} alphas × {n_cv_folds} folds)\n"
+        )
 
     # ------------------------------------------------------------------
     # fit
@@ -877,6 +1203,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         self : PretrainedLassoCV
             Fitted estimator.
         """
+        t0 = time.time()
         self._validate_params()
 
         if feature_names is None and hasattr(X, "columns"):
@@ -896,13 +1223,30 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
 
         scorer_fn = _resolve_scorer(self.scoring)
 
+        n_cv_folds = self.cv if self.foldid is None else len(np.unique(self.foldid))
+        total_cv_fits = n_cv_folds * len(alphas)
+
+        if self.verbose:
+            print(
+                f"\nPretrainedLassoCV  {self.family}  ·  {len(unique_groups)} groups"
+                f"  ·  {self.n_features_in_} features"
+                f"  ·  {len(alphas)} alphas × {n_cv_folds} folds = {total_cv_fits} fits"
+            )
+            from tqdm import tqdm as _tqdm
+
+            _pbar = _tqdm(total=total_cv_fits, desc="  CV fits", unit="fit")
+        else:
+            _pbar = None
+
         # Fold-level accumulators
         fold_losses = {a: [] for a in alphas}
         fold_losses_grp = {a: {g: [] for g in unique_groups} for a in alphas}
         fold_losses_ind = []
         fold_losses_ov = []
 
+        _fold_num = 0
         for train_idx, test_idx in self._fold_iter(X, groups):
+            _fold_num += 1
             X_tr, X_te = X[train_idx], X[test_idx]
             y_tr, y_te = y[train_idx], y[test_idx]
             g_tr, g_te = groups[train_idx], groups[test_idx]
@@ -926,6 +1270,15 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                     y_ov = est.predict(X_te, g_te, model="overall")
                     fold_losses_ind.append(_cv_loss(scorer_fn, y_te, y_ind, self.family))
                     fold_losses_ov.append(_cv_loss(scorer_fn, y_te, y_ov, self.family))
+
+                if _pbar is not None:
+                    _pbar.update(1)
+                    _pbar.set_postfix(
+                        alpha=f"{a:.2f}", fold=f"{_fold_num}/{n_cv_folds}", refresh=False
+                    )
+
+        if _pbar is not None:
+            _pbar.close()
 
         # Aggregate CV results
         self.cv_results_ = {a: float(np.mean(errs)) for a, errs in fold_losses.items()}
@@ -969,10 +1322,15 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         # Refit on full data for each unique alpha required (best + varying)
         unique_alphas = set(self.varying_alphahat_.values()) | {self.alpha_}
         fit_kwargs = dict(group_labels=group_labels, feature_names=feature_names)
+        if self.verbose:
+            print(f"  Refitting at α={self.alpha_:.2f} (best) ...", end="", flush=True)
+            _t_refit = time.time()
         self.all_estimators_ = {
             a: self._base_estimator(a).fit(X, y, groups, **fit_kwargs) for a in unique_alphas
         }
         self.best_estimator_ = self.all_estimators_[self.alpha_]
+        if self.verbose:
+            print(f" done  ({time.time() - _t_refit:.1f}s)")
 
         # Mirror fitted attributes from the best estimator for a uniform interface
         for attr in (
@@ -980,14 +1338,20 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             "overall_lmda_idx_",
             "overall_coef_",
             "pretrain_models_",
+            "pretrain_lmda_idx_",
             "individual_models_",
+            "individual_lmda_idx_",
             "groups_",
             "feature_names_in_",
             "n_classes_",
+            "_n_onehot_",
         ):
             setattr(self, attr, getattr(self.best_estimator_, attr))
         if self.family != "multinomial":
             self.overall_intercept_ = self.best_estimator_.overall_intercept_
+
+        if self.verbose:
+            self._print_cv_summary(time.time() - t0, n_cv_folds)
 
         return self
 
@@ -1001,7 +1365,9 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         check_is_fitted(self, ["alpha_"])
         return self.alpha_
 
-    def predict(self, X, groups, model="pretrain", alphatype="best", lmda_idx=None):
+    def predict(
+        self, X, groups, model="pretrain", type="response", alphatype="best", lmda_idx=None
+    ):
         """Predict target values.
 
         Parameters
@@ -1009,6 +1375,9 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         X : array-like of shape (n_samples, n_features)
         groups : array-like of shape (n_samples,)
         model : {"pretrain", "individual", "overall"}, default="pretrain"
+        type : {"response", "link", "class"}, default="response"
+            Scale of the returned predictions.  See :meth:`PretrainedLasso.predict`
+            for full documentation.
         alphatype : {"best", "varying"}, default="best"
             ``"best"`` uses the globally selected ``alpha_``; ``"varying"``
             uses each group's own optimal alpha from ``varying_alphahat_``.
@@ -1017,13 +1386,16 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         Returns
         -------
         y_pred : ndarray of shape (n_samples,) or (n_samples, K)
-            Shape is ``(n_samples, K)`` for multinomial.
+            Shape is ``(n_samples, K)`` for multinomial ``"response"`` or
+            ``"link"``.
         """
         check_is_fitted(self)
         groups = np.asarray(groups)
 
         if model not in PREDICT_MODELS:
             raise ValueError(f"model must be one of {PREDICT_MODELS}, got '{model}'")
+        if type not in PREDICT_TYPES:
+            raise ValueError(f"type must be one of {PREDICT_TYPES}, got '{type}'")
         if alphatype not in ALPHATYPES:
             raise ValueError(f"alphatype must be one of {ALPHATYPES}, got '{alphatype}'")
 
@@ -1035,11 +1407,13 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                 mask = groups == g
                 a = self.varying_alphahat_.get(g, self.alpha_)
                 y_pred[mask] = self.all_estimators_[a].predict(
-                    X[mask], groups[mask], model=model, lmda_idx=lmda_idx
+                    X[mask], groups[mask], model=model, type=type, lmda_idx=lmda_idx
                 )
             return y_pred
 
-        return self.best_estimator_.predict(X=X, groups=groups, model=model, lmda_idx=lmda_idx)
+        return self.best_estimator_.predict(
+            X=X, groups=groups, model=model, type=type, lmda_idx=lmda_idx
+        )
 
     def evaluate(self, X, y, groups, alphatype="best"):
         """Predict and score with all three sub-models.

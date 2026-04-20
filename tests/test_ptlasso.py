@@ -84,14 +84,18 @@ def test_fit_predict_gaussian():
     assert y_pred.shape == (len(y),)
 
 
-def test_alpha_one_equals_individual():
-    # alpha=1 → no pretraining → pretrain predictions == individual predictions
+def test_alpha_one_no_pretraining():
+    # alpha=1 → offset = 0, penalty factors all = 1 (no pretraining signal).
+    # Each group runs its own cv_grpnet so lambda paths can differ slightly;
+    # exact prediction equality is not guaranteed.  Verify that per-group
+    # lambda indices are stored and predictions are finite.
     X, y, groups = _gaussian_data()
     model = PretrainedLasso(alpha=1).fit(X, y, groups)
-    np.testing.assert_allclose(
-        model.predict(X, groups, model="pretrain"),
-        model.predict(X, groups, model="individual"),
-    )
+    for g in model.groups_:
+        assert 0 <= model.pretrain_lmda_idx_[g] < model.lmda_path_size
+        assert 0 <= model.individual_lmda_idx_[g] < model.lmda_path_size
+    assert np.all(np.isfinite(model.predict(X, groups, model="pretrain")))
+    assert np.all(np.isfinite(model.predict(X, groups, model="individual")))
 
 
 def test_score_returns_float():
@@ -304,6 +308,78 @@ def test_cv_multinomial():
     model = PretrainedLassoCV(alphas=[0.0, 0.5, 1.0], cv=3, family="multinomial").fit(X, y, groups)
     y_pred = model.predict(X, groups)
     assert y_pred.shape == (len(y), model.n_classes_)
+
+
+# ------------------------------------------------------------------
+# predict type parameter
+# ------------------------------------------------------------------
+
+
+def test_predict_type_link_gaussian():
+    X, y, groups = _gaussian_data()
+    model = PretrainedLasso(alpha=0.5).fit(X, y, groups)
+    # For gaussian, link == response
+    link = model.predict(X, groups, type="link")
+    resp = model.predict(X, groups, type="response")
+    np.testing.assert_array_equal(link, resp)
+
+
+def test_predict_type_link_binomial():
+    X, y, groups = _binary_data()
+    model = PretrainedLasso(alpha=0.5, family="binomial").fit(X, y, groups)
+    link = model.predict(X, groups, type="link")
+    resp = model.predict(X, groups, type="response")
+    # link is unbounded; response is in [0, 1]
+    assert link.shape == resp.shape == (len(y),)
+    assert np.all((resp >= 0) & (resp <= 1))
+    assert not np.all((link >= 0) & (link <= 1))  # some logits outside [0,1]
+
+
+def test_predict_type_class_binomial():
+    X, y, groups = _binary_data()
+    model = PretrainedLasso(alpha=0.5, family="binomial").fit(X, y, groups)
+    for m in ("pretrain", "individual", "overall"):
+        labels = model.predict(X, groups, model=m, type="class")
+        assert labels.shape == (len(y),)
+        assert set(np.unique(labels)).issubset({0, 1})
+
+
+def test_predict_type_class_multinomial():
+    X, y, groups = _multi_data()
+    model = PretrainedLasso(alpha=0.5, family="multinomial").fit(X, y, groups)
+    labels = model.predict(X, groups, type="class")
+    assert labels.shape == (len(y),)
+    assert set(np.unique(labels)).issubset(set(range(model.n_classes_)))
+
+
+def test_predict_type_class_invalid_for_gaussian():
+    X, y, groups = _gaussian_data()
+    model = PretrainedLasso(alpha=0.5).fit(X, y, groups)
+    with pytest.raises(ValueError, match="class"):
+        model.predict(X, groups, type="class")
+
+
+def test_predict_type_invalid():
+    X, y, groups = _gaussian_data()
+    model = PretrainedLasso(alpha=0.5).fit(X, y, groups)
+    with pytest.raises(ValueError):
+        model.predict(X, groups, type="probability")
+
+
+def test_cv_predict_type_link():
+    X, y, groups = _binary_data()
+    cv = PretrainedLassoCV(alphas=[0.0, 0.5, 1.0], cv=3, family="binomial").fit(X, y, groups)
+    link = cv.predict(X, groups, type="link")
+    resp = cv.predict(X, groups, type="response")
+    assert link.shape == resp.shape == (len(y),)
+    assert np.all((resp >= 0) & (resp <= 1))
+
+
+def test_cv_predict_type_class():
+    X, y, groups = _binary_data()
+    cv = PretrainedLassoCV(alphas=[0.0, 0.5, 1.0], cv=3, family="binomial").fit(X, y, groups)
+    labels = cv.predict(X, groups, type="class")
+    assert set(np.unique(labels)).issubset({0, 1})
 
 
 # ------------------------------------------------------------------
