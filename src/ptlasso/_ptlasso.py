@@ -284,7 +284,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         Whether to fit an intercept in every sub-model.
     lmda_path_size : int, default=100
         Number of lambdas in the regularisation path.
-    min_ratio : float, default=0.01
+    min_ratio : float, default=0.0001
         Ratio of the smallest to largest lambda on the path.
     verbose : bool, default=True
         Whether to display fitting progress and a summary after training.
@@ -336,7 +336,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         overall_lambda="lambda.1se",
         fit_intercept=True,
         lmda_path_size=100,
-        min_ratio=0.01,
+        min_ratio=0.0001,
         verbose=True,
         n_threads=1,
     ):
@@ -987,7 +987,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         Whether to fit an intercept in every sub-model.
     lmda_path_size : int, default=100
         Number of lambdas in the regularisation path.
-    min_ratio : float, default=0.01
+    min_ratio : float, default=0.0001
         Ratio of the smallest to largest lambda on the path.
     verbose : bool, default=True
         Whether to display fitting progress and a summary after training.
@@ -1058,7 +1058,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         overall_lambda="lambda.1se",
         fit_intercept=True,
         lmda_path_size=100,
-        min_ratio=0.01,
+        min_ratio=0.0001,
         verbose=True,
         foldid=None,
         scoring=None,
