@@ -1356,7 +1356,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             g_tr, g_te = groups[train_idx], groups[test_idx]
 
             if self.verbose:
-                print(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44)
+                print(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44, flush=True)
+                print("  Overall model (λ-path):", flush=True)
 
             # Stage 1 (overall model + OOF) is identical for every alpha within
             # a fold — fit it once and reuse, avoiding repeated identical
@@ -1367,11 +1368,18 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             _stage1.fit(X_tr, y_tr, g_tr)
             _preval_offset = _stage1._preval_offset
 
-            _pbar = (
-                _tqdm(total=len(alphas), desc="  Group fits", unit="α", leave=True)
-                if self.verbose
-                else None
-            )
+            if self.verbose:
+                _n_support = (
+                    int(np.sum(_stage1.overall_coef_ != 0))
+                    if self.family != "multinomial"
+                    else int(np.sum(np.any(_stage1.overall_coef_ != 0, axis=1)))
+                )
+                print(f"  Overall model done  |S|={_n_support}", flush=True)
+
+            _pbar = None
+            if self.verbose:
+                _pbar = _tqdm(total=len(alphas), desc="  Group fits", unit="α", leave=True)
+                _pbar.refresh()  # force initial render on buffered terminals
 
             for i, a in enumerate(alphas):
                 if i == 0:
