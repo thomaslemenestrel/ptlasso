@@ -289,7 +289,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
     verbose : bool, default=True
         Whether to display fitting progress and a summary after training.
         Adelie's internal output is always suppressed regardless of this setting.
-    n_threads : int, default=1
+    n_threads : int, default=-1
         Number of threads passed to adelie's solver.  Set to a higher value
         to parallelise the coordinate descent within each model fit.
         ``-1`` uses all available CPU cores (``os.cpu_count()``).
@@ -338,7 +338,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         lmda_path_size=100,
         min_ratio=0.0001,
         verbose=True,
-        n_threads=1,
+        n_threads=-1,
     ):
         self.alpha = alpha
         self.family = family
@@ -410,6 +410,12 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             n_threads=n_threads,
         )
 
+    def _wrap_matrix(self, X):
+        # adelie incurs ~20x slowdown when matrix and solver use different
+        # n_threads (OpenMP switching cost). Wrap X so both use the same value.
+        n_threads = os.cpu_count() if self.n_threads == -1 else self.n_threads
+        return ad.matrix.dense(X, method="naive", n_threads=n_threads)
+
     def _overall_eta(self, X, groups):
         """Overall linear predictor at the selected lambda.
 
@@ -473,7 +479,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
             glm_fold = _make_glm(self.family, y_tr)
             with _silence():
-                fold_state = ad.grpnet(X_tr, glm_fold, penalty=overall_pf, **self._grpnet_kwargs())
+                fold_state = ad.grpnet(self._wrap_matrix(X_tr), glm_fold, penalty=overall_pf, **self._grpnet_kwargs())
 
             # Find the lambda in this fold's path closest to the full-data lamhat.
             lmdas = np.asarray(fold_state.lmdas)
@@ -632,7 +638,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             _t1 = time.time()
         with _silence():
             cv_overall = ad.cv_grpnet(
-                X_overall, glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+                self._wrap_matrix(X_overall), glm_all, penalty=overall_pf, **self._grpnet_kwargs()
             )
 
             self.overall_lmda_idx_ = (
@@ -641,7 +647,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 else _lmda_1se_idx(cv_overall)
             )
             self.overall_model_ = cv_overall.fit(
-                X_overall, glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+                self._wrap_matrix(X_overall), glm_all, penalty=overall_pf, **self._grpnet_kwargs()
             )
 
         # Extract X-feature coefficients only (skip the k-1 onehot columns).
@@ -718,16 +724,16 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             # (lambda.min), then refit on the full group data at that lambda.
             with _silence():
                 cv_pre = ad.cv_grpnet(
-                    X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
                 )
                 self.pretrain_lmda_idx_[g] = cv_pre.best_idx
                 self.pretrain_models_[g] = cv_pre.fit(
-                    X_g, glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
                 )
 
-                cv_ind = ad.cv_grpnet(X_g, glm_g, **self._grpnet_kwargs())
+                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
                 self.individual_lmda_idx_[g] = cv_ind.best_idx
-                self.individual_models_[g] = cv_ind.fit(X_g, glm_g, **self._grpnet_kwargs())
+                self.individual_models_[g] = cv_ind.fit(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
 
         if self.verbose:
             self._print_fit_summary(time.time() - t0)
@@ -995,7 +1001,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
     foldid : array-like of int or None, default=None
         Fold assignments, one integer per sample.  When provided, overrides
         the internal ``StratifiedKFold`` splitter.
-    n_threads : int, default=1
+    n_threads : int, default=-1
         Number of threads passed to adelie's solver.  Set to a higher value
         to parallelise the coordinate descent within each model fit.
         ``-1`` uses all available CPU cores (``os.cpu_count()``).
@@ -1062,7 +1068,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         verbose=True,
         foldid=None,
         scoring=None,
-        n_threads=1,
+        n_threads=-1,
     ):
         self.alphas = alphas
         self.cv = cv
