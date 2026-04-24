@@ -482,7 +482,9 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
             glm_fold = _make_glm(self.family, y_tr)
             with _silence():
-                fold_state = ad.grpnet(self._wrap_matrix(X_tr), glm_fold, penalty=overall_pf, **self._grpnet_kwargs())
+                fold_state = ad.grpnet(
+                    self._wrap_matrix(X_tr), glm_fold, penalty=overall_pf, **self._grpnet_kwargs()
+                )
 
             # Find the lambda in this fold's path closest to the full-data lamhat.
             lmdas = np.asarray(fold_state.lmdas)
@@ -734,16 +736,26 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             # (lambda.min), then refit on the full group data at that lambda.
             with _silence():
                 cv_pre = ad.cv_grpnet(
-                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g),
+                    glm_g,
+                    offsets=offset,
+                    penalty=pf,
+                    **self._grpnet_kwargs(),
                 )
                 self.pretrain_lmda_idx_[g] = cv_pre.best_idx
                 self.pretrain_models_[g] = cv_pre.fit(
-                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf, **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g),
+                    glm_g,
+                    offsets=offset,
+                    penalty=pf,
+                    **self._grpnet_kwargs(),
                 )
 
                 cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
                 self.individual_lmda_idx_[g] = cv_ind.best_idx
-                self.individual_models_[g] = cv_ind.fit(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
+                self.individual_models_[g] = cv_ind.fit(
+                    self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs()
+                )
 
         if self.verbose:
             self._print_fit_summary(time.time() - t0)
@@ -785,13 +797,19 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
             with _silence():
                 cv_pre = ad.cv_grpnet(
-                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf,
-                    **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g),
+                    glm_g,
+                    offsets=offset,
+                    penalty=pf,
+                    **self._grpnet_kwargs(),
                 )
                 self.pretrain_lmda_idx_[g] = cv_pre.best_idx
                 self.pretrain_models_[g] = cv_pre.fit(
-                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf,
-                    **self._grpnet_kwargs()
+                    self._wrap_matrix(X_g),
+                    glm_g,
+                    offsets=offset,
+                    penalty=pf,
+                    **self._grpnet_kwargs(),
                 )
 
                 cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
