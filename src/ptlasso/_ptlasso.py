@@ -645,21 +645,39 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         # ----------------------------------------------------------
         glm_all = _make_glm(self.family, y)
         if self.verbose:
-            print("  [1/2] Overall model (CV) ...", end="", flush=True)
+            print("  [1/2] Overall model (CV) ...", flush=True)
             _t1 = time.time()
+
+        # cv_grpnet (lambda selection via internal CV folds) — always silent.
         with _silence():
             cv_overall = ad.cv_grpnet(
                 self._wrap_matrix(X_overall), glm_all, penalty=overall_pf, **self._grpnet_kwargs()
             )
-
             self.overall_lmda_idx_ = (
                 cv_overall.best_idx
                 if self.overall_lambda == "lambda.min"
                 else _lmda_1se_idx(cv_overall)
             )
+
+        # Final refit on full data — show adelie's lambda-path progress bar when
+        # either verbose=True (standalone use) or the CV loop opts in via
+        # _show_overall_progress (so the user sees progress during the long fit).
+        _show_progress = self.verbose or getattr(self, "_show_overall_progress", False)
+        if _show_progress:
             self.overall_model_ = cv_overall.fit(
-                self._wrap_matrix(X_overall), glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+                self._wrap_matrix(X_overall),
+                glm_all,
+                penalty=overall_pf,
+                **{**self._grpnet_kwargs(), "progress_bar": True},
             )
+        else:
+            with _silence():
+                self.overall_model_ = cv_overall.fit(
+                    self._wrap_matrix(X_overall),
+                    glm_all,
+                    penalty=overall_pf,
+                    **self._grpnet_kwargs(),
+                )
 
         # Extract X-feature coefficients only (skip the k-1 onehot columns).
         # overall_coef_ has shape (p,) or (p, K) — identical to the no-group-
@@ -1322,9 +1340,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             )
             from tqdm import tqdm as _tqdm
 
-            _pbar = _tqdm(total=total_cv_fits, desc="  CV fits", unit="fit")
-        else:
-            _pbar = None
+            _n_threads = os.cpu_count() if self.n_threads == -1 else self.n_threads
 
         # Fold-level accumulators
         fold_losses = {a: [] for a in alphas}
@@ -1339,12 +1355,23 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             y_tr, y_te = y[train_idx], y[test_idx]
             g_tr, g_te = groups[train_idx], groups[test_idx]
 
+            if self.verbose:
+                print(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44)
+
             # Stage 1 (overall model + OOF) is identical for every alpha within
             # a fold — fit it once and reuse, avoiding repeated identical
             # ad.cv_grpnet calls on the same data which hang on HPC clusters.
+            # _show_overall_progress exposes adelie's lambda-path bar for this fit.
             _stage1 = self._base_estimator(alphas[0])
+            _stage1._show_overall_progress = self.verbose
             _stage1.fit(X_tr, y_tr, g_tr)
             _preval_offset = _stage1._preval_offset
+
+            _pbar = (
+                _tqdm(total=len(alphas), desc="  Group fits", unit="α", leave=True)
+                if self.verbose
+                else None
+            )
 
             for i, a in enumerate(alphas):
                 if i == 0:
@@ -1386,12 +1413,10 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
 
                 if _pbar is not None:
                     _pbar.update(1)
-                    _pbar.set_postfix(
-                        alpha=f"{a:.2f}", fold=f"{_fold_num}/{n_cv_folds}", refresh=False
-                    )
+                    _pbar.set_postfix(alpha=f"{a:.2f}", threads=_n_threads, refresh=False)
 
-        if _pbar is not None:
-            _pbar.close()
+            if _pbar is not None:
+                _pbar.close()
 
         # Aggregate CV results
         self.cv_results_ = {a: float(np.mean(errs)) for a, errs in fold_losses.items()}
