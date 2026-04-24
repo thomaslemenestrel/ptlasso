@@ -478,6 +478,8 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         _show_oof = getattr(self, "_show_overall_progress", False)
         _oof_pbar = None
         if _show_oof:
+            from tqdm import tqdm as _tqdm
+
             _oof_pbar = _tqdm(total=n_folds, desc="  OOF folds", unit="fold", leave=False)
             _oof_pbar.refresh()
         for train_idx, test_idx in splitter.split(X_overall, groups):
