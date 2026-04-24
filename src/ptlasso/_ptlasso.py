@@ -18,6 +18,7 @@ import numpy as np
 from sklearn.base import RegressorMixin
 from sklearn.metrics import accuracy_score, log_loss, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 from ._base import BasePretrainedLasso
@@ -339,6 +340,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         min_ratio=0.0001,
         verbose=True,
         n_threads=-1,
+        standardize=True,
     ):
         self.alpha = alpha
         self.family = family
@@ -348,6 +350,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         self.min_ratio = min_ratio
         self.verbose = verbose
         self.n_threads = n_threads
+        self.standardize = standardize
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -563,6 +566,12 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         X, y = check_X_y(X, y, dtype=np.float64, order="F")
         self.n_features_in_ = X.shape[1]
 
+        # Standardize features to zero mean / unit std, matching glmnet's
+        # default (standardize=TRUE).  The one-hot group-indicator columns
+        # added later are built after this step and left un-standardized.
+        self.scaler_ = StandardScaler(with_mean=True, with_std=self.standardize)
+        X = self.scaler_.fit_transform(X)
+
         if feature_names is not None:
             feature_names = np.asarray(feature_names)
             if len(feature_names) != self.n_features_in_:
@@ -671,6 +680,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         # predictions avoid this leakage.
         # ----------------------------------------------------------
         preval_offset = self._compute_oof_eta(X_overall, y, overall_pf, groups)
+        self._preval_offset = preval_offset  # cached for PretrainedLassoCV reuse
 
         # ----------------------------------------------------------
         # Step 2: per-group models
@@ -740,6 +750,56 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
         return self
 
+    def _fit_groups_only(self, X, y, groups, preval_offset):
+        """Fit stage-2 group models, reusing the stage-1 state already on self.
+
+        Called by PretrainedLassoCV to avoid re-running the expensive overall
+        model + OOF computation for every alpha within the same CV fold.
+        Requires that all stage-1 attributes (overall_model_, overall_coef_,
+        overall_lmda_idx_, n_features_in_, groups_, _n_onehot_, etc.) are
+        already set (typically copied from a template estimator).
+        """
+        X = np.asfortranarray(self.scaler_.transform(np.asarray(X, dtype=np.float64)))
+        y = np.asarray(y, dtype=np.float64)
+        groups = np.asarray(groups)
+
+        if self.family == "multinomial":
+            overall_support = np.where(np.any(self.overall_coef_ != 0, axis=1))[0]
+        else:
+            overall_support = np.where(self.overall_coef_ != 0)[0]
+
+        _alpha_pf = self.alpha if self.alpha > 0 else 1e-9
+        pf = np.full(self.n_features_in_, 1.0 / _alpha_pf)
+        pf[overall_support] = 1.0
+
+        self.pretrain_models_ = {}
+        self.pretrain_lmda_idx_ = {}
+        self.individual_models_ = {}
+        self.individual_lmda_idx_ = {}
+
+        for g in self.groups_:
+            mask = groups == g
+            X_g = np.asfortranarray(X[mask])
+            glm_g = _make_glm(self.family, y[mask])
+            offset = np.asfortranarray((1 - self.alpha) * preval_offset[mask])
+
+            with _silence():
+                cv_pre = ad.cv_grpnet(
+                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf,
+                    **self._grpnet_kwargs()
+                )
+                self.pretrain_lmda_idx_[g] = cv_pre.best_idx
+                self.pretrain_models_[g] = cv_pre.fit(
+                    self._wrap_matrix(X_g), glm_g, offsets=offset, penalty=pf,
+                    **self._grpnet_kwargs()
+                )
+
+                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
+                self.individual_lmda_idx_[g] = cv_ind.best_idx
+                self.individual_models_[g] = cv_ind.fit(
+                    self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs()
+                )
+
     # ------------------------------------------------------------------
     # predict / score / evaluate
     # ------------------------------------------------------------------
@@ -778,6 +838,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         """
         check_is_fitted(self)
         X = check_array(X, dtype=np.float64, order="F")
+        X = np.asfortranarray(self.scaler_.transform(X))
         groups = np.asarray(groups)
 
         if model not in PREDICT_MODELS:
@@ -1069,6 +1130,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         foldid=None,
         scoring=None,
         n_threads=-1,
+        standardize=True,
     ):
         self.alphas = alphas
         self.cv = cv
@@ -1082,6 +1144,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         self.foldid = foldid
         self.scoring = scoring
         self.n_threads = n_threads
+        self.standardize = standardize
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1130,6 +1193,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             min_ratio=self.min_ratio,
             verbose=False,  # CV sub-fits are silent; PretrainedLassoCV owns the progress bar
             n_threads=self.n_threads,
+            standardize=self.standardize,
         )
 
     def _fold_iter(self, X, groups):
@@ -1257,8 +1321,33 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             y_tr, y_te = y[train_idx], y[test_idx]
             g_tr, g_te = groups[train_idx], groups[test_idx]
 
+            # Stage 1 (overall model + OOF) is identical for every alpha within
+            # a fold — fit it once and reuse, avoiding repeated identical
+            # ad.cv_grpnet calls on the same data which hang on HPC clusters.
+            _stage1 = self._base_estimator(alphas[0])
+            _stage1.fit(X_tr, y_tr, g_tr)
+            _preval_offset = _stage1._preval_offset
+
             for i, a in enumerate(alphas):
-                est = self._base_estimator(a).fit(X_tr, y_tr, g_tr)
+                if i == 0:
+                    est = _stage1
+                else:
+                    est = self._base_estimator(a)
+                    # Copy stage-1 state so _fit_groups_only can use it.
+                    est.n_features_in_ = _stage1.n_features_in_
+                    est.groups_ = _stage1.groups_
+                    est.group_labels_ = _stage1.group_labels_
+                    est.n_classes_ = _stage1.n_classes_
+                    est.feature_names_in_ = _stage1.feature_names_in_
+                    est._n_onehot_ = _stage1._n_onehot_
+                    est.scaler_ = _stage1.scaler_
+                    est.overall_model_ = _stage1.overall_model_
+                    est.overall_lmda_idx_ = _stage1.overall_lmda_idx_
+                    est.overall_coef_ = _stage1.overall_coef_
+                    if self.family != "multinomial":
+                        est.overall_intercept_ = _stage1.overall_intercept_
+                    est._fit_groups_only(X_tr, y_tr, g_tr, _preval_offset)
+
                 y_pred = est.predict(X_te, g_te)
                 fold_losses[a].append(_cv_loss(scorer_fn, y_te, y_pred, self.family))
 
