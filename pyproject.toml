@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ptlasso"
-version = "0.3.3"
+version = "0.3.4"
 description = "Pretrained Lasso: a two-step procedure for sparse linear models with grouped samples"
 readme = "README.md"
 license = { file = "LICENSE" }
