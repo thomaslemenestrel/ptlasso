@@ -475,6 +475,11 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         n_folds = max(2, n_folds)
 
         splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        _show_oof = getattr(self, "_show_overall_progress", False)
+        _oof_pbar = None
+        if _show_oof:
+            _oof_pbar = _tqdm(total=n_folds, desc="  OOF folds", unit="fold", leave=False)
+            _oof_pbar.refresh()
         for train_idx, test_idx in splitter.split(X_overall, groups):
             X_tr = np.asfortranarray(X_overall[train_idx])
             y_tr = y[train_idx]
@@ -493,6 +498,11 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             oof_eta[test_idx] = _eta_from_state(
                 fold_state, X_te, lmda_idx, self.family, self.n_classes_
             )
+            if _oof_pbar is not None:
+                _oof_pbar.update(1)
+                _oof_pbar.refresh()
+        if _oof_pbar is not None:
+            _oof_pbar.close()
 
         return oof_eta
 
