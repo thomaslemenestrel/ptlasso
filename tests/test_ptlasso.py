@@ -1,3 +1,5 @@
+import contextlib
+import io
 import logging
 import re
 import warnings
@@ -473,29 +475,48 @@ def test_single_group_raises():
 # ------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _capture_ptlasso_logs():
+    """Inject a StringIO handler directly on the ptlasso logger.
+
+    Works regardless of propagate setting, so it correctly captures log output
+    even when _enable_verbose_logging() sets propagate=False.
+    """
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.DEBUG)
+    ptlasso_logger = logging.getLogger("ptlasso")
+    ptlasso_logger.addHandler(handler)
+    try:
+        yield buf
+    finally:
+        ptlasso_logger.removeHandler(handler)
+
+
 def _fit_verbose_cv(n=90, p=8, k=3, alphas=None, cv=2):
     X, y, groups = _gaussian_data(n=n, p=p, k=k)
     model = PretrainedLassoCV(alphas=alphas or [0.5, 1.0], cv=cv, verbose=True)
     model.fit(X, y, groups)
 
 
-def test_verbose_expected_labels_present(caplog):
+def test_verbose_expected_labels_present():
     """All key progress labels appear in verbose output."""
-    with caplog.at_level(logging.INFO, logger="ptlasso"):
+    with _capture_ptlasso_logs() as buf:
         _fit_verbose_cv()
-    assert "CV λ-selection" in caplog.text
-    assert "Full-data refit" in caplog.text
-    assert "OOF fold" in caplog.text
-    assert "OOF done" in caplog.text
-    assert "Overall model done" in caplog.text
+    text = buf.getvalue()
+    assert "CV λ-selection" in text
+    assert "Full-data refit" in text
+    assert "OOF fold" in text
+    assert "OOF done" in text
+    assert "Overall model done" in text
 
 
-def test_verbose_output_order(caplog):
+def test_verbose_output_order():
     """Progress labels appear in the correct sequence within each fold."""
-    with caplog.at_level(logging.INFO, logger="ptlasso"):
+    with _capture_ptlasso_logs() as buf:
         _fit_verbose_cv()
 
-    lines = caplog.text.splitlines()
+    lines = buf.getvalue().splitlines()
 
     def first(keyword):
         for i, line in enumerate(lines):
@@ -512,15 +533,15 @@ def test_verbose_output_order(caplog):
     )
 
 
-def test_verbose_oof_lines_not_cleared(caplog):
+def test_verbose_oof_lines_not_cleared():
     """Every OOF fold produces a permanent log line — none disappear.
 
     This catches tqdm leave=False regressions where the bar is erased on close.
     """
-    with caplog.at_level(logging.INFO, logger="ptlasso"):
+    with _capture_ptlasso_logs() as buf:
         _fit_verbose_cv(n=90, k=3)
 
-    oof_lines = [line for line in caplog.text.splitlines() if "OOF fold" in line]
+    oof_lines = [line for line in buf.getvalue().splitlines() if "OOF fold" in line]
     assert len(oof_lines) > 0, "No OOF fold lines found — they may have been cleared"
 
     fold_nums = []
@@ -541,10 +562,10 @@ def test_verbose_oof_lines_not_cleared(caplog):
         )
 
 
-def test_verbose_no_output_when_silent(caplog):
+def test_verbose_no_output_when_silent():
     """verbose=False produces no log output."""
     X, y, groups = _gaussian_data(n=90, p=8, k=3)
     model = PretrainedLassoCV(alphas=[0.5, 1.0], cv=2, verbose=False)
-    with caplog.at_level(logging.INFO, logger="ptlasso"):
+    with _capture_ptlasso_logs() as buf:
         model.fit(X, y, groups)
-    assert caplog.text == "", "Unexpected log output with verbose=False"
+    assert buf.getvalue() == "", "Unexpected log output with verbose=False"

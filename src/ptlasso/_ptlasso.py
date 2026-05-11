@@ -47,6 +47,7 @@ def _enable_verbose_logging():
         _h.setFormatter(logging.Formatter("%(message)s"))
         root.addHandler(_h)
     root.setLevel(logging.DEBUG)
+    root.propagate = False
 
 
 # ------------------------------------------------------------------
