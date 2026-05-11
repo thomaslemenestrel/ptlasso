@@ -42,12 +42,16 @@ def _enable_verbose_logging():
     logging themselves — matching the old print() behaviour.
     """
     root = logging.getLogger("ptlasso")
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-        _h = logging.StreamHandler()
-        _h.setFormatter(logging.Formatter("%(message)s"))
-        root.addHandler(_h)
     root.setLevel(logging.DEBUG)
-    root.propagate = False
+    # Only add our own handler when the application hasn't configured logging.
+    # If there are root handlers already (e.g. logging.basicConfig in the script),
+    # let propagation carry the messages through — the app controls the format.
+    if not logging.root.handlers:
+        if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+            _h = logging.StreamHandler()
+            _h.setFormatter(logging.Formatter("%(message)s"))
+            root.addHandler(_h)
+        root.propagate = False
 
 
 # ------------------------------------------------------------------
