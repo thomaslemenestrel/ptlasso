@@ -9,12 +9,12 @@ PretrainedLassoCV
 """
 
 import contextlib
+import logging
 import os
 import time
 
 import adelie as ad
 import numpy as np
-
 from sklearn.base import RegressorMixin
 from sklearn.metrics import accuracy_score, log_loss, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -31,6 +31,22 @@ from ._constants import (
     ALPHATYPES,
     DEFAULT_ALPHAS,
 )
+
+_logger = logging.getLogger(__name__)
+
+
+def _enable_verbose_logging():
+    """Attach a plain StreamHandler to the ptlasso logger if none is active.
+
+    Called when verbose=True so users see output without having to configure
+    logging themselves — matching the old print() behaviour.
+    """
+    root = logging.getLogger("ptlasso")
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(_h)
+    root.setLevel(logging.DEBUG)
 
 
 # ------------------------------------------------------------------
@@ -478,6 +494,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         _show_oof = getattr(self, "_show_overall_progress", False)
         if _show_oof:
             _t_oof = time.time()
+            _logger.info("    OOF predictions:")
         for _oof_i, (train_idx, test_idx) in enumerate(splitter.split(X_overall, groups)):
             X_tr = np.asfortranarray(X_overall[train_idx])
             y_tr = y[train_idx]
@@ -497,9 +514,9 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 fold_state, X_te, lmda_idx, self.family, self.n_classes_
             )
             if _show_oof:
-                print(f"    OOF fold {_oof_i + 1}/{n_folds} done", flush=True)
+                _logger.info(f"    OOF fold {_oof_i + 1}/{n_folds} done")
         if _show_oof:
-            print(f"    OOF done ({time.time() - _t_oof:.1f}s)", flush=True)
+            _logger.info(f"    OOF done ({time.time() - _t_oof:.1f}s)")
 
         return oof_eta
 
@@ -529,12 +546,12 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             f"{self._label(g)}: |S|={self._support_size(self.individual_models_[g], self.individual_lmda_idx_[g])}"
             for g in self.groups_
         )
-        print(SEP)
-        print(f"  {'overall':<13}|S| = {n_ov}")
-        print(f"  {'pretrain':<13}{pre_parts}")
-        print(f"  {'individual':<13}{ind_parts}")
-        print(SEP)
-        print(f"  Fitted in {elapsed:.1f}s\n")
+        _logger.info(SEP)
+        _logger.info(f"  {'overall':<13}|S| = {n_ov}")
+        _logger.info(f"  {'pretrain':<13}{pre_parts}")
+        _logger.info(f"  {'individual':<13}{ind_parts}")
+        _logger.info(SEP)
+        _logger.info(f"  Fitted in {elapsed:.1f}s")
 
     # ------------------------------------------------------------------
     # fit
@@ -624,10 +641,11 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         )
 
         if self.verbose:
+            _enable_verbose_logging()
             k = len(self.groups_)
             glabels = [str(self._label(g)) for g in self.groups_]
             gstr = ", ".join(glabels[:4]) + (f" +{k - 4} more" if k > 4 else "")
-            print(
+            _logger.info(
                 f"\nPretrainedLasso  {self.family}  ·  {k} groups ({gstr})"
                 f"  ·  {self.n_features_in_} features  ·  α={self.alpha}"
             )
@@ -656,7 +674,6 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         # cv_grpnet runs K internal CV folds with OpenMP — progress_bar=True would
         # spawn K bars simultaneously, so we always silence it and show a timer.
         if _show_progress:
-            print("    CV λ-selection ...", end="", flush=True)
             _t_cv = time.time()
         with _silence():
             cv_overall = ad.cv_grpnet(
@@ -671,8 +688,8 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             else _lmda_1se_idx(cv_overall)
         )
         if _show_progress:
-            print(f" done ({time.time() - _t_cv:.1f}s)", flush=True)
-            print("    Full-data refit (λ-path):", flush=True)
+            _logger.info(f"    CV λ-selection done ({time.time() - _t_cv:.1f}s)")
+            _logger.info("    Full-data refit (λ-path):")
             self.overall_model_ = cv_overall.fit(
                 self._wrap_matrix(X_overall),
                 glm_all,
@@ -731,7 +748,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 n_ov = int(np.sum(np.any(self.overall_coef_ != 0, axis=1)))
             else:
                 n_ov = int(np.sum(self.overall_coef_ != 0))
-            print(f"  Overall model done  |S|={n_ov}", flush=True)
+            _logger.info(f"  Overall model done  |S|={n_ov}")
 
         self.pretrain_models_ = {}
         self.pretrain_lmda_idx_ = {}
@@ -746,7 +763,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                     self.groups_, desc="  [2/2] Group models", unit="group", leave=True
                 )
             except ImportError:
-                print("  [2/2] Group models")
+                _logger.info("  [2/2] Group models")
                 group_iter = self.groups_
         else:
             group_iter = self.groups_
@@ -1263,16 +1280,19 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
 
     def _print_cv_summary(self, elapsed, n_cv_folds):
         SEP = "─" * 54
-        print(SEP)
-        print(f"    {'α':<8} {'CV loss':<12} {'±SE'}")
-        print(f"  {'─' * 34}")
+        rows = [SEP, f"    {'α':<8} {'CV loss':<12} {'±SE'}", f"  {'─' * 34}"]
         for a in self.alphalist_:
             marker = "►" if a == self.alpha_ else " "
-            print(f" {marker}  {a:<8.2f} {self.cv_results_[a]:<12.4f} {self.cv_results_se_[a]:.4f}")
-        print(f"  {'─' * 34}")
-        print(f"  {'individual':<13}{self.cv_results_individual_:.4f}")
-        print(f"  {'overall':<13}{self.cv_results_overall_:.4f}")
-        print(SEP)
+            rows.append(
+                f" {marker}  {a:<8.2f} {self.cv_results_[a]:<12.4f} {self.cv_results_se_[a]:.4f}"
+            )
+        rows += [
+            f"  {'─' * 34}",
+            f"  {'individual':<13}{self.cv_results_individual_:.4f}",
+            f"  {'overall':<13}{self.cv_results_overall_:.4f}",
+            SEP,
+        ]
+        _logger.info("\n".join(rows))
         best = self.best_estimator_
         stage2 = set()
         for g in self.groups_:
@@ -1282,10 +1302,10 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                 stage2 |= set(int(i) for i in np.where(np.any(c != 0, axis=1))[0])
             else:
                 stage2 |= set(int(i) for i in np.where(c != 0)[0])
-        print(
+        _logger.info(
             f"  Best α = {self.alpha_:.2f}   |S| = {len(stage2)}"
             f"   Fitted in {elapsed:.1f}s"
-            f"  ({len(self.alphalist_)} alphas × {n_cv_folds} folds)\n"
+            f"  ({len(self.alphalist_)} alphas × {n_cv_folds} folds)"
         )
 
     # ------------------------------------------------------------------
@@ -1342,7 +1362,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         total_cv_fits = n_cv_folds * len(alphas)
 
         if self.verbose:
-            print(
+            _enable_verbose_logging()
+            _logger.info(
                 f"\nPretrainedLassoCV  {self.family}  ·  {len(unique_groups)} groups"
                 f"  ·  {self.n_features_in_} features"
                 f"  ·  {len(alphas)} alphas × {n_cv_folds} folds = {total_cv_fits} fits"
@@ -1365,8 +1386,8 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             g_tr, g_te = groups[train_idx], groups[test_idx]
 
             if self.verbose:
-                print(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44, flush=True)
-                print("  Overall model (λ-path):", flush=True)
+                _logger.info(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44)
+                _logger.info("  Overall model (λ-path):")
 
             # Stage 1 (overall model + OOF) is identical for every alpha within
             # a fold — fit it once and reuse, avoiding repeated identical
@@ -1383,7 +1404,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
                     if self.family != "multinomial"
                     else int(np.sum(np.any(_stage1.overall_coef_ != 0, axis=1)))
                 )
-                print(f"  Overall model done  |S|={_n_support}", flush=True)
+                _logger.info(f"  Overall model done  |S|={_n_support}")
 
             _pbar = None
             if self.verbose:
@@ -1478,14 +1499,13 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         unique_alphas = set(self.varying_alphahat_.values()) | {self.alpha_}
         fit_kwargs = dict(group_labels=group_labels, feature_names=feature_names)
         if self.verbose:
-            print(f"  Refitting at α={self.alpha_:.2f} (best) ...", end="", flush=True)
             _t_refit = time.time()
         self.all_estimators_ = {
             a: self._base_estimator(a).fit(X, y, groups, **fit_kwargs) for a in unique_alphas
         }
         self.best_estimator_ = self.all_estimators_[self.alpha_]
         if self.verbose:
-            print(f" done  ({time.time() - _t_refit:.1f}s)")
+            _logger.info(f"  Refitting at α={self.alpha_:.2f} done ({time.time() - _t_refit:.1f}s)")
 
         # Mirror fitted attributes from the best estimator for a uniform interface
         for attr in (

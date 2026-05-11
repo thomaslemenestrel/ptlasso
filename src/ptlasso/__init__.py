@@ -27,6 +27,8 @@ Simulation helpers
 make_data, gaussian_example_data, binomial_example_data
 """
 
+import logging
+
 from ._ptlasso import PretrainedLasso, PretrainedLassoCV
 from ._support import (
     get_individual_support,
@@ -37,6 +39,8 @@ from ._support import (
 from ._plot import plot_cv, plot_paths
 from ._simulate import make_data, gaussian_example_data, binomial_example_data
 from ._constants import COLORS, FIGURE_WIDTHS
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 try:
     from importlib.metadata import version as _version, PackageNotFoundError
