@@ -476,13 +476,9 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
 
         splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         _show_oof = getattr(self, "_show_overall_progress", False)
-        _oof_pbar = None
         if _show_oof:
-            from tqdm import tqdm as _tqdm
-
-            _oof_pbar = _tqdm(total=n_folds, desc="  OOF folds", unit="fold", leave=False)
-            _oof_pbar.refresh()
-        for train_idx, test_idx in splitter.split(X_overall, groups):
+            _t_oof = time.time()
+        for _oof_i, (train_idx, test_idx) in enumerate(splitter.split(X_overall, groups)):
             X_tr = np.asfortranarray(X_overall[train_idx])
             y_tr = y[train_idx]
             X_te = np.asfortranarray(X_overall[test_idx])
@@ -500,11 +496,10 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             oof_eta[test_idx] = _eta_from_state(
                 fold_state, X_te, lmda_idx, self.family, self.n_classes_
             )
-            if _oof_pbar is not None:
-                _oof_pbar.update(1)
-                _oof_pbar.refresh()
-        if _oof_pbar is not None:
-            _oof_pbar.close()
+            if _show_oof:
+                print(f"    OOF fold {_oof_i + 1}/{n_folds} done", flush=True)
+        if _show_oof:
+            print(f"    OOF done ({time.time() - _t_oof:.1f}s)", flush=True)
 
         return oof_eta
 
@@ -656,26 +651,28 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         # Step 1: overall model (lambda selected by CV)
         # ----------------------------------------------------------
         glm_all = _make_glm(self.family, y)
-        if self.verbose:
-            print("  [1/2] Overall model (CV) ...", flush=True)
-            _t1 = time.time()
+        _show_progress = self.verbose or getattr(self, "_show_overall_progress", False)
 
-        # cv_grpnet (lambda selection via internal CV folds) — always silent.
+        # cv_grpnet runs K internal CV folds with OpenMP — progress_bar=True would
+        # spawn K bars simultaneously, so we always silence it and show a timer.
+        if _show_progress:
+            print("    CV λ-selection ...", end="", flush=True)
+            _t_cv = time.time()
         with _silence():
             cv_overall = ad.cv_grpnet(
-                self._wrap_matrix(X_overall), glm_all, penalty=overall_pf, **self._grpnet_kwargs()
+                self._wrap_matrix(X_overall),
+                glm_all,
+                penalty=overall_pf,
+                **self._grpnet_kwargs(),
             )
-            self.overall_lmda_idx_ = (
-                cv_overall.best_idx
-                if self.overall_lambda == "lambda.min"
-                else _lmda_1se_idx(cv_overall)
-            )
-
-        # Final refit on full data — show adelie's lambda-path progress bar when
-        # either verbose=True (standalone use) or the CV loop opts in via
-        # _show_overall_progress (so the user sees progress during the long fit).
-        _show_progress = self.verbose or getattr(self, "_show_overall_progress", False)
+        self.overall_lmda_idx_ = (
+            cv_overall.best_idx
+            if self.overall_lambda == "lambda.min"
+            else _lmda_1se_idx(cv_overall)
+        )
         if _show_progress:
+            print(f" done ({time.time() - _t_cv:.1f}s)", flush=True)
+            print("    Full-data refit (λ-path):", flush=True)
             self.overall_model_ = cv_overall.fit(
                 self._wrap_matrix(X_overall),
                 glm_all,
@@ -734,7 +731,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 n_ov = int(np.sum(np.any(self.overall_coef_ != 0, axis=1)))
             else:
                 n_ov = int(np.sum(self.overall_coef_ != 0))
-            print(f" done  ({time.time() - _t1:.1f}s)  |S|={n_ov}")
+            print(f"  Overall model done  |S|={n_ov}", flush=True)
 
         self.pretrain_models_ = {}
         self.pretrain_lmda_idx_ = {}

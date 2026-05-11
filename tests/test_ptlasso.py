@@ -1,4 +1,7 @@
+import io
+import re
 import warnings
+from contextlib import redirect_stdout
 
 import numpy as np
 import pytest
@@ -464,3 +467,85 @@ def test_single_group_raises():
     groups = np.zeros(len(y), dtype=int)
     with pytest.raises(ValueError):
         PretrainedLasso().fit(X, y, groups)
+
+
+# ------------------------------------------------------------------
+# Verbose output structure
+# ------------------------------------------------------------------
+
+
+def _capture_verbose_cv(n=90, p=8, k=3, alphas=None, cv=2):
+    """Fit a small PretrainedLassoCV with verbose=True and return captured stdout lines."""
+    X, y, groups = _gaussian_data(n=n, p=p, k=k)
+    model = PretrainedLassoCV(alphas=alphas or [0.5, 1.0], cv=cv, verbose=True)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        model.fit(X, y, groups)
+    return [l for l in buf.getvalue().splitlines() if l.strip()]
+
+
+def test_verbose_expected_labels_present():
+    """All key progress labels appear in verbose output."""
+    lines = _capture_verbose_cv()
+    text = "\n".join(lines)
+    assert "CV λ-selection" in text
+    assert "Full-data refit" in text
+    assert "OOF fold" in text
+    assert "OOF done" in text
+    assert "Overall model done" in text
+
+
+def test_verbose_output_order():
+    """Progress labels appear in the correct sequence within each fold."""
+    lines = _capture_verbose_cv()
+
+    def first(keyword):
+        for i, l in enumerate(lines):
+            if keyword in l:
+                return i
+        return float("inf")
+
+    assert first("CV λ-selection") < first("Full-data refit"), \
+        "CV λ-selection should precede full-data refit"
+    assert first("Full-data refit") < first("OOF fold"), \
+        "Full-data refit should precede OOF folds"
+    assert first("OOF done") < first("Overall model done"), \
+        "OOF done should precede overall model done"
+
+
+def test_verbose_oof_lines_not_cleared():
+    """Every OOF fold produces a permanent output line — none disappear.
+
+    This catches tqdm leave=False regressions where the bar is erased on close.
+    """
+    lines = _capture_verbose_cv(n=90, k=3)
+    oof_lines = [l for l in lines if "OOF fold" in l]
+
+    assert len(oof_lines) > 0, "No OOF fold lines found — they may have been cleared"
+
+    # Lines must be numbered consecutively starting from 1.
+    fold_nums = []
+    for l in oof_lines:
+        m = re.search(r"OOF fold (\d+)/(\d+)", l)
+        assert m, f"Unexpected OOF fold line format: {l!r}"
+        fold_nums.append(int(m.group(1)))
+
+    n_folds = int(re.search(r"OOF fold \d+/(\d+)", oof_lines[0]).group(1))
+    # There is one OOF block per outer CV fold; each block must be 1..n_folds.
+    assert len(fold_nums) % n_folds == 0, \
+        f"Total OOF lines ({len(fold_nums)}) not a multiple of n_folds ({n_folds})"
+    expected_block = list(range(1, n_folds + 1))
+    for start in range(0, len(fold_nums), n_folds):
+        block = fold_nums[start : start + n_folds]
+        assert block == expected_block, \
+            f"OOF fold lines incomplete or out of order in block: {block}"
+
+
+def test_verbose_no_output_when_silent():
+    """verbose=False produces no stdout output."""
+    X, y, groups = _gaussian_data(n=90, p=8, k=3)
+    model = PretrainedLassoCV(alphas=[0.5, 1.0], cv=2, verbose=False)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        model.fit(X, y, groups)
+    assert buf.getvalue() == "", "Unexpected stdout output with verbose=False"
