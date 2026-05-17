@@ -17,7 +17,7 @@ import adelie as ad
 import numpy as np
 from sklearn.base import RegressorMixin
 from sklearn.metrics import accuracy_score, log_loss, mean_squared_error, r2_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
@@ -362,6 +362,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         verbose=True,
         n_threads=-1,
         standardize=True,
+        n_folds=10,
     ):
         self.alpha = alpha
         self.family = family
@@ -372,6 +373,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         self.verbose = verbose
         self.n_threads = n_threads
         self.standardize = standardize
+        self.n_folds = n_folds
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -434,6 +436,9 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
             n_threads=n_threads,
         )
 
+    def _cv_grpnet_kwargs(self):
+        return {**self._grpnet_kwargs(), "n_folds": self.n_folds}
+
     def _wrap_matrix(self, X):
         # adelie incurs ~20x slowdown when matrix and solver use different
         # n_threads (OpenMP switching cost). Wrap X so both use the same value.
@@ -491,9 +496,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         else:
             oof_eta = np.zeros(n)
 
-        # Determine number of folds: cap at min group size, floor at 2.
-        n_folds = min(10, min(int(np.sum(groups == g)) for g in self.groups_))
-        n_folds = max(2, n_folds)
+        n_folds = self._n_folds_oof_
 
         splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         _show_oof = getattr(self, "_show_overall_progress", False)
@@ -522,6 +525,71 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 _logger.info(f"    OOF fold {_oof_i + 1}/{n_folds} done")
         if _show_oof:
             _logger.info(f"    OOF done ({time.time() - _t_oof:.1f}s)")
+
+        return oof_eta
+
+    def _compute_group_oof_eta(self, X_g, y_g, g_offset_oof, pf, lamhat_g):
+        """OOF linear predictor for a group model (group contribution only, no offset).
+
+        Mirrors R's ``cv.glmnet(..., keep=TRUE)`` for stage-2 group models.
+        Each sample is predicted by a fold model that never saw it during
+        training.  The caller adds back ``(1-alpha)*overall_oof_eta[mask]`` to
+        obtain the full combined pretrain predictor.
+
+        Parameters
+        ----------
+        X_g : (n_g, p) ndarray
+            Standardized group feature matrix (already passed through scaler).
+        y_g : (n_g,) ndarray
+            Group targets.
+        g_offset_oof : (n_g,) ndarray or None
+            OOF offset for training fold models: ``(1-alpha)*overall_oof_eta``
+            for this group.  Pass ``None`` for individual (no-offset) models.
+        pf : (p,) ndarray or None
+            Stage-2 penalty factors.  ``None`` means uniform (no weighting).
+        lamhat_g : float
+            Selected lambda from the full-data group model; each fold model's
+            nearest lambda is used for prediction (matches glmnet keep=TRUE).
+
+        Returns
+        -------
+        oof_eta : (n_g,) or (n_g, K) ndarray
+            Group model OOF linear predictor WITHOUT the overall offset.
+        """
+        n_g = X_g.shape[0]
+
+        n_folds = self._n_folds_oof_
+        if self.family in ("binomial", "multinomial"):
+            y_int = y_g.astype(int)
+            splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+            fold_iter = list(splitter.split(X_g, y_int))
+        else:
+            fold_iter = list(KFold(n_splits=n_folds, shuffle=True, random_state=42).split(X_g))
+
+        if self.family == "multinomial":
+            oof_eta = np.zeros((n_g, self.n_classes_))
+        else:
+            oof_eta = np.zeros(n_g)
+
+        for train_idx, test_idx in fold_iter:
+            X_tr = np.asfortranarray(X_g[train_idx])
+            y_tr = y_g[train_idx]
+            X_te = np.asfortranarray(X_g[test_idx])
+
+            glm_fold = _make_glm(self.family, y_tr)
+            kw = self._grpnet_kwargs()
+            if pf is not None:
+                kw["penalty"] = pf
+            if g_offset_oof is not None:
+                kw["offsets"] = np.asfortranarray(g_offset_oof[train_idx])
+            with _silence():
+                fold_state = ad.grpnet(self._wrap_matrix(X_tr), glm_fold, **kw)
+
+            lmdas = np.asarray(fold_state.lmdas)
+            lmda_idx = int(np.argmin(np.abs(lmdas - lamhat_g))) if len(lmdas) > 0 else 0
+            oof_eta[test_idx] = _eta_from_state(
+                fold_state, X_te, lmda_idx, self.family, self.n_classes_
+            )
 
         return oof_eta
 
@@ -633,6 +701,17 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
         if len(self.groups_) < 2:
             raise ValueError("groups must contain at least 2 unique values")
 
+        # Single OOF fold count used by both _compute_oof_eta and
+        # _compute_group_oof_eta, matching R's uniform nfolds across all models.
+        _min_group = min(int(np.sum(groups == g)) for g in self.groups_)
+        if self.family in ("binomial", "multinomial"):
+            _min_class = min(
+                int(np.bincount(np.asarray(y)[groups == g].astype(int)).min()) for g in self.groups_
+            )
+            self._n_folds_oof_ = max(2, min(self.n_folds, _min_group, _min_class))
+        else:
+            self._n_folds_oof_ = max(2, min(self.n_folds, _min_group))
+
         if group_labels is not None:
             if not isinstance(group_labels, dict):
                 raise TypeError(f"group_labels must be a dict, got {type(group_labels).__name__}")
@@ -685,7 +764,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                 self._wrap_matrix(X_overall),
                 glm_all,
                 penalty=overall_pf,
-                **self._grpnet_kwargs(),
+                **self._cv_grpnet_kwargs(),
             )
         self.overall_lmda_idx_ = (
             cv_overall.best_idx
@@ -789,7 +868,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                     glm_g,
                     offsets=offset,
                     penalty=pf,
-                    **self._grpnet_kwargs(),
+                    **self._cv_grpnet_kwargs(),
                 )
                 self.pretrain_lmda_idx_[g] = cv_pre.best_idx
                 self.pretrain_models_[g] = cv_pre.fit(
@@ -800,7 +879,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                     **self._grpnet_kwargs(),
                 )
 
-                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
+                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._cv_grpnet_kwargs())
                 self.individual_lmda_idx_[g] = cv_ind.best_idx
                 self.individual_models_[g] = cv_ind.fit(
                     self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs()
@@ -850,7 +929,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                     glm_g,
                     offsets=offset,
                     penalty=pf,
-                    **self._grpnet_kwargs(),
+                    **self._cv_grpnet_kwargs(),
                 )
                 self.pretrain_lmda_idx_[g] = cv_pre.best_idx
                 self.pretrain_models_[g] = cv_pre.fit(
@@ -861,7 +940,7 @@ class PretrainedLasso(RegressorMixin, BasePretrainedLasso):
                     **self._grpnet_kwargs(),
                 )
 
-                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs())
+                cv_ind = ad.cv_grpnet(self._wrap_matrix(X_g), glm_g, **self._cv_grpnet_kwargs())
                 self.individual_lmda_idx_[g] = cv_ind.best_idx
                 self.individual_models_[g] = cv_ind.fit(
                     self._wrap_matrix(X_g), glm_g, **self._grpnet_kwargs()
@@ -1198,6 +1277,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         scoring=None,
         n_threads=-1,
         standardize=True,
+        n_folds=10,
     ):
         self.alphas = alphas
         self.cv = cv
@@ -1212,6 +1292,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         self.scoring = scoring
         self.n_threads = n_threads
         self.standardize = standardize
+        self.n_folds = n_folds
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1261,6 +1342,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             verbose=False,  # CV sub-fits are silent; PretrainedLassoCV owns the progress bar
             n_threads=self.n_threads,
             standardize=self.standardize,
+            n_folds=self.n_folds,
         )
 
     def _fold_iter(self, X, groups):
@@ -1283,7 +1365,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
     # Progress / display helpers
     # ------------------------------------------------------------------
 
-    def _print_cv_summary(self, elapsed, n_cv_folds):
+    def _print_cv_summary(self, elapsed):
         SEP = "─" * 54
         rows = [SEP, f"    {'α':<8} {'CV loss':<12} {'±SE'}", f"  {'─' * 34}"]
         for a in self.alphalist_:
@@ -1310,7 +1392,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
         _logger.info(
             f"  Best α = {self.alpha_:.2f}   |S| = {len(stage2)}"
             f"   Fitted in {elapsed:.1f}s"
-            f"  ({len(self.alphalist_)} alphas × {n_cv_folds} folds)"
+            f"  ({len(self.alphalist_)} alphas · OOF-based)"
         )
 
     # ------------------------------------------------------------------
@@ -1363,154 +1445,173 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
 
         scorer_fn = _resolve_scorer(self.scoring)
 
-        n_cv_folds = self.cv if self.foldid is None else len(np.unique(self.foldid))
-        total_cv_fits = n_cv_folds * len(alphas)
-
         if self.verbose:
             _enable_verbose_logging()
             _logger.info(
                 f"\nPretrainedLassoCV  {self.family}  ·  {len(unique_groups)} groups"
                 f"  ·  {self.n_features_in_} features"
-                f"  ·  {len(alphas)} alphas × {n_cv_folds} folds = {total_cv_fits} fits"
+                f"  ·  {len(alphas)} alphas · OOF-based (all data)"
             )
             from tqdm import tqdm as _tqdm
 
-            _n_threads = os.cpu_count() if self.n_threads == -1 else self.n_threads
+        # --- R-style architecture: train all models on full data, evaluate
+        #     via within-model OOF predictions (mirrors cv.glmnet keep=TRUE).
+        #     No data is withheld from model fitting. ---
 
-        # Fold-level accumulators
-        fold_losses = {a: [] for a in alphas}
-        fold_losses_grp = {a: {g: [] for g in unique_groups} for a in alphas}
-        fold_losses_ind = []
-        fold_losses_ov = []
+        if self.verbose:
+            _logger.info("\n── Full-data fit (all samples) " + "─" * 26)
+            _logger.info("  Overall model (λ-path):")
 
-        _fold_num = 0
-        for train_idx, test_idx in self._fold_iter(X, groups):
-            _fold_num += 1
-            X_tr, X_te = X[train_idx], X[test_idx]
-            y_tr, y_te = y[train_idx], y[test_idx]
-            g_tr, g_te = groups[train_idx], groups[test_idx]
+        # Step 1: fit stage-1 (overall model + OOF) once on ALL data.
+        _stage1 = self._base_estimator(alphas[0])
+        _stage1._show_overall_progress = self.verbose
+        _stage1.fit(X, y, groups, group_labels=group_labels, feature_names=feature_names)
+        _preval_offset = _stage1._preval_offset  # (n,) OOF overall linear predictor
 
-            if self.verbose:
-                _logger.info(f"\n── Fold {_fold_num}/{n_cv_folds} " + "─" * 44)
-                _logger.info("  Overall model (λ-path):")
+        if self.verbose:
+            _n_support = (
+                int(np.sum(_stage1.overall_coef_ != 0))
+                if self.family != "multinomial"
+                else int(np.sum(np.any(_stage1.overall_coef_ != 0, axis=1)))
+            )
+            _logger.info(f"  Overall model done  |S|={_n_support}")
 
-            # Stage 1 (overall model + OOF) is identical for every alpha within
-            # a fold — fit it once and reuse, avoiding repeated identical
-            # ad.cv_grpnet calls on the same data which hang on HPC clusters.
-            # _show_overall_progress exposes adelie's lambda-path bar for this fit.
-            _stage1 = self._base_estimator(alphas[0])
-            _stage1._show_overall_progress = self.verbose
-            _stage1.fit(X_tr, y_tr, g_tr)
-            _preval_offset = _stage1._preval_offset
+        # Standardized X used by all group models.
+        X_std = np.asfortranarray(_stage1.scaler_.transform(np.asarray(X, dtype=np.float64)))
 
-            if self.verbose:
-                _n_support = (
-                    int(np.sum(_stage1.overall_coef_ != 0))
-                    if self.family != "multinomial"
-                    else int(np.sum(np.any(_stage1.overall_coef_ != 0, axis=1)))
-                )
-                _logger.info(f"  Overall model done  |S|={_n_support}")
+        # Per-alpha OOF accumulators (all n samples, no fold averaging).
+        oof_losses = {}
+        oof_losses_grp = {a: {} for a in alphas}
+        all_estimators_full = {}
 
-            _pbar = None
-            if self.verbose:
-                _pbar = _tqdm(total=len(alphas), desc="  Group fits", unit="α", leave=True)
-                _pbar.refresh()  # force initial render on buffered terminals
+        # Pre-compute individual OOF once — doesn't depend on alpha.
+        if self.family == "multinomial":
+            _oof_ind_eta = np.zeros((len(y), _stage1.n_classes_))
+        else:
+            _oof_ind_eta = np.zeros(len(y))
+        for _g in unique_groups:
+            _mask = groups == _g
+            _lhat_ind = float(
+                _stage1.individual_models_[_g].lmdas[_stage1.individual_lmda_idx_[_g]]
+            )
+            _oof_ind_eta[_mask] = _stage1._compute_group_oof_eta(
+                np.asfortranarray(X_std[_mask]), y[_mask], None, None, _lhat_ind
+            )
+        self.cv_results_individual_ = _cv_loss(
+            scorer_fn, y, _apply_link(_oof_ind_eta, self.family), self.family
+        )
 
-            for i, a in enumerate(alphas):
-                if i == 0:
-                    est = _stage1
-                else:
-                    est = self._base_estimator(a)
-                    # Copy stage-1 state so _fit_groups_only can use it.
-                    est.n_features_in_ = _stage1.n_features_in_
-                    est.groups_ = _stage1.groups_
-                    est.group_labels_ = _stage1.group_labels_
-                    est.n_classes_ = _stage1.n_classes_
-                    est.feature_names_in_ = _stage1.feature_names_in_
-                    est._n_onehot_ = _stage1._n_onehot_
-                    est.scaler_ = _stage1.scaler_
-                    est.overall_model_ = _stage1.overall_model_
-                    est.overall_lmda_idx_ = _stage1.overall_lmda_idx_
-                    est.overall_coef_ = _stage1.overall_coef_
-                    if self.family != "multinomial":
-                        est.overall_intercept_ = _stage1.overall_intercept_
-                    est._fit_groups_only(X_tr, y_tr, g_tr, _preval_offset)
+        # Overall OOF score comes directly from _preval_offset.
+        self.cv_results_overall_ = _cv_loss(
+            scorer_fn, y, _apply_link(_preval_offset, self.family), self.family
+        )
 
-                y_pred = est.predict(X_te, g_te)
-                fold_losses[a].append(_cv_loss(scorer_fn, y_te, y_pred, self.family))
+        _pbar = None
+        if self.verbose:
+            _pbar = _tqdm(total=len(alphas), desc="  Group fits", unit="α", leave=True)
+            _pbar.refresh()
 
-                for g in unique_groups:
-                    mask = g_te == g
-                    if mask.any():
-                        fold_losses_grp[a][g].append(
-                            _cv_loss(scorer_fn, y_te[mask], y_pred[mask], self.family)
-                        )
+        for i, a in enumerate(alphas):
+            # Step 2: fit stage-2 group models for this alpha on ALL data.
+            if i == 0:
+                est = _stage1  # already fully fitted
+            else:
+                est = self._base_estimator(a)
+                est.n_features_in_ = _stage1.n_features_in_
+                est.groups_ = _stage1.groups_
+                est.group_labels_ = _stage1.group_labels_
+                est.n_classes_ = _stage1.n_classes_
+                est.feature_names_in_ = _stage1.feature_names_in_
+                est._n_onehot_ = _stage1._n_onehot_
+                est.scaler_ = _stage1.scaler_
+                est.overall_model_ = _stage1.overall_model_
+                est.overall_lmda_idx_ = _stage1.overall_lmda_idx_
+                est.overall_coef_ = _stage1.overall_coef_
+                est._n_folds_oof_ = _stage1._n_folds_oof_
+                if self.family != "multinomial":
+                    est.overall_intercept_ = _stage1.overall_intercept_
+                est._fit_groups_only(X, y, groups, _preval_offset)
+            all_estimators_full[a] = est
 
-                # Individual and overall baselines don't depend on alpha — compute
-                # once per fold using the first alpha's fitted estimator.
-                if i == 0:
-                    y_ind = est.predict(X_te, g_te, model="individual")
-                    y_ov = est.predict(X_te, g_te, model="overall")
-                    fold_losses_ind.append(_cv_loss(scorer_fn, y_te, y_ind, self.family))
-                    fold_losses_ov.append(_cv_loss(scorer_fn, y_te, y_ov, self.family))
+            # Step 3: compute OOF pretrain predictions on all n samples.
+            # Penalty factor matches _fit_groups_only.
+            if self.family == "multinomial":
+                _ovsupp = np.where(np.any(est.overall_coef_ != 0, axis=1))[0]
+            else:
+                _ovsupp = np.where(est.overall_coef_ != 0)[0]
+            _apf = a if a > 0 else 1e-9
+            _pf = np.full(est.n_features_in_, 1.0 / _apf)
+            _pf[_ovsupp] = 1.0
 
-                if _pbar is not None:
-                    _pbar.update(1)
-                    _pbar.set_postfix(alpha=f"{a:.2f}", threads=_n_threads, refresh=False)
+            if self.family == "multinomial":
+                oof_pre_eta = np.zeros((len(y), est.n_classes_))
+            else:
+                oof_pre_eta = np.zeros(len(y))
+
+            for g in unique_groups:
+                mask = groups == g
+                X_g = np.asfortranarray(X_std[mask])
+                y_g = y[mask]
+                g_offset = np.asfortranarray((1.0 - a) * _preval_offset[mask])
+                lamhat_g = float(est.pretrain_models_[g].lmdas[est.pretrain_lmda_idx_[g]])
+                # Group model OOF (without offset) + overall offset = full OOF pretrain eta.
+                oof_g = est._compute_group_oof_eta(X_g, y_g, g_offset, _pf, lamhat_g)
+                oof_pre_eta[mask] = oof_g + (1.0 - a) * _preval_offset[mask]
+
+                y_pred_g = _apply_link(oof_pre_eta[mask], self.family)
+                oof_losses_grp[a][g] = _cv_loss(scorer_fn, y[mask], y_pred_g, self.family)
+
+            y_pred_pre = _apply_link(oof_pre_eta, self.family)
+            oof_losses[a] = _cv_loss(scorer_fn, y, y_pred_pre, self.family)
 
             if _pbar is not None:
-                _pbar.close()
+                _pbar.update(1)
+                _pbar.set_postfix(alpha=f"{a:.2f}", refresh=False)
 
-        # Aggregate CV results
-        self.cv_results_ = {a: float(np.mean(errs)) for a, errs in fold_losses.items()}
-        self.cv_results_se_ = {
-            a: float(np.std(errs, ddof=1) / np.sqrt(len(errs))) for a, errs in fold_losses.items()
-        }
-        self.cv_results_per_group_ = {
-            a: {
-                g: float(np.mean(fold_losses_grp[a][g])) if fold_losses_grp[a][g] else np.nan
-                for g in unique_groups
-            }
-            for a in alphas
-        }
+        if _pbar is not None:
+            _pbar.close()
+
+        # Aggregate OOF results.
+        self.cv_results_ = oof_losses
+        self.cv_results_se_ = {a: 0.0 for a in alphas}  # no SE without fold averaging
+        self.cv_results_per_group_ = oof_losses_grp
         self.cv_results_mean_ = {
-            a: float(np.nanmean(list(self.cv_results_per_group_[a].values()))) for a in alphas
+            a: float(np.nanmean(list(oof_losses_grp[a].values()))) for a in alphas
         }
         self.cv_results_wtd_mean_ = {
             a: float(
                 np.nansum(
                     [
-                        self.cv_results_per_group_[a][g] * group_sizes[g] / len(y)
+                        oof_losses_grp[a][g] * group_sizes[g] / len(y)
                         for g in unique_groups
+                        if not np.isnan(oof_losses_grp[a].get(g, float("nan")))
                     ]
                 )
             )
             for a in alphas
         }
-        self.cv_results_individual_ = float(np.mean(fold_losses_ind))
-        self.cv_results_overall_ = float(np.mean(fold_losses_ov))
 
-        # Select global best alpha
+        # Select global best alpha.
         criterion = self.cv_results_mean_ if self.alphahat_choice == "mean" else self.cv_results_
         self.alpha_ = min(alphas, key=criterion.__getitem__)
 
-        # Per-group best alpha
+        # Per-group best alpha.
         self.varying_alphahat_ = {
             g: min(alphas, key=lambda a, _g=g: self.cv_results_per_group_[a].get(_g, np.inf))
             for g in unique_groups
         }
 
-        # Refit on full data for each unique alpha required (best + varying)
+        # All models were already fitted on full data above — no refit needed.
         unique_alphas = set(self.varying_alphahat_.values()) | {self.alpha_}
         fit_kwargs = dict(group_labels=group_labels, feature_names=feature_names)
-        if self.verbose:
-            _t_refit = time.time()
-        self.all_estimators_ = {
-            a: self._base_estimator(a).fit(X, y, groups, **fit_kwargs) for a in unique_alphas
-        }
+        self.all_estimators_ = {}
+        for a in unique_alphas:
+            if a in all_estimators_full:
+                self.all_estimators_[a] = all_estimators_full[a]
+            else:
+                # Shouldn't happen: all alphalist_ alphas were fitted above.
+                self.all_estimators_[a] = self._base_estimator(a).fit(X, y, groups, **fit_kwargs)
         self.best_estimator_ = self.all_estimators_[self.alpha_]
-        if self.verbose:
-            _logger.info(f"  Refitting at α={self.alpha_:.2f} done ({time.time() - _t_refit:.1f}s)")
 
         # Mirror fitted attributes from the best estimator for a uniform interface
         for attr in (
@@ -1531,7 +1632,7 @@ class PretrainedLassoCV(RegressorMixin, BasePretrainedLasso):
             self.overall_intercept_ = self.best_estimator_.overall_intercept_
 
         if self.verbose:
-            self._print_cv_summary(time.time() - t0, n_cv_folds)
+            self._print_cv_summary(time.time() - t0)
 
         return self
 
